@@ -15,3 +15,15 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-openg
 - 自动杀掉进程  
 - 自动删除目录  
 - 自动检测运行状态  
+
+# RFW一键防火墙脚本
+
+## 🚀 一键执行命令
+
+复制下面命令即可一键运行RFW：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/rfw.sh)
+```
+
+## 📄 功能
