@@ -5,7 +5,7 @@
 复制下面命令即可一键清理 OpenGFW：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/myuser/opengfw-tools/main/clean-gfw.sh)"
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/uninstall_opengfw.sh)
 ```
 
 ## 📄 功能
