@@ -1,3 +1,19 @@
+# RFW一键防火墙脚本
+
+## 🚀 一键执行命令
+
+复制下面命令即可一键运行RFW：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/rfw.sh)
+```
+
+# 内存优化
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/memory.sh)
+```
+
 # OpenGFW 一键清理工具
 
 ## 🚀 一键执行命令
