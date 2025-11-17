@@ -2,16 +2,19 @@
 set -e
 
 echo "==========================================="
-echo " OpenVPN 出口服务器自动部署脚本 V11 (最终稳定版)"
+echo " OpenVPN 出口服务器自动部署脚本 V12（IPv4 + IPv6 双栈）"
 echo "==========================================="
 
-#----------- 检测公网 IP -----------
-PUB_IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
-echo "出口公网 IP: $PUB_IP"
+#----------- 检测出口 IPv4 / IPv6 -----------
+PUB_IP4=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
+PUB_IP6=$(curl -s ipv6.ip.sb || echo "")
+
+echo "出口 IPv4: $PUB_IP4"
+echo "出口 IPv6: ${PUB_IP6:-未检测到 IPv6}"
 
 #----------- 检测网卡 -----------
 NIC=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
-echo "检测到出网网卡: $NIC"
+echo "出口网卡: $NIC"
 
 apt update -y
 apt install -y openvpn easy-rsa sshpass iptables-persistent curl
@@ -22,7 +25,6 @@ mkdir -p /etc/openvpn/easy-rsa
 cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
 cd /etc/openvpn/easy-rsa
 
-#----------- 启用 batch 模式（无交互）-----------
 export EASYRSA_BATCH=1
 
 echo ">>> 初始化 PKI ..."
@@ -40,7 +42,7 @@ echo ">>> 生成客户端证书 ..."
 echo ">>> 生成 DH 参数 ..."
 ./easyrsa gen-dh
 
-# 拷贝到 OpenVPN 目录
+#----------- 拷贝证书 -----------
 cp pki/ca.crt /etc/openvpn/
 cp pki/dh.pem /etc/openvpn/
 cp pki/issued/server.crt /etc/openvpn/
@@ -48,7 +50,7 @@ cp pki/private/server.key /etc/openvpn/
 cp pki/issued/client.crt /etc/openvpn/
 cp pki/private/client.key /etc/openvpn/
 
-#----------- 自动选择可用端口 -----------
+#----------- 查找空闲端口 -----------
 find_free_port() {
   p=$1
   while ss -tuln | grep -q ":$p "; do
@@ -63,7 +65,31 @@ TCP_PORT=$(find_free_port 443)
 echo "UDP端口 = $UDP_PORT"
 echo "TCP端口 = $TCP_PORT"
 
-#----------- 生成 server.conf (UDP) -----------
+#----------- 启用 IPv4 / IPv6 转发 -----------
+
+echo 1 >/proc/sys/net/ipv4/ip_forward
+sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+
+echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
+sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
+
+#----------- 配置 NAT (IPv4) -----------
+iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o $NIC -j MASQUERADE
+
+#----------- 配置 NAT (IPv6) 可用才启用 -----------
+HAS_IPV6=0
+if [[ -n "$PUB_IP6" ]]; then
+    if command -v ip6tables >/dev/null; then
+        HAS_IPV6=1
+        echo "检测到 IPv6，启用 IPv6 NAT..."
+        ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
+    fi
+fi
+
+iptables-save >/etc/iptables/rules.v4
+ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+
+#----------- server.conf（UDP）-----------
 cat >/etc/openvpn/server.conf <<EOF
 port $UDP_PORT
 proto udp
@@ -74,20 +100,23 @@ key server.key
 dh dh.pem
 
 server 10.8.0.0 255.255.255.0
+server-ipv6 fd00:1234::/64
+
+push "redirect-gateway def1 ipv6 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS6 2620:119:35::35"
+push "dhcp-option DNS6 2606:4700:4700::1111"
+
 keepalive 10 120
 cipher AES-256-GCM
 auth SHA256
-
-push "redirect-gateway def1 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
-push "dhcp-option DNS 1.1.1.1"
-
 persist-key
 persist-tun
 verb 3
 EOF
 
-#----------- 生成 server-tcp.conf (TCP) -----------
+#----------- server-tcp.conf（TCP）-----------
 cat >/etc/openvpn/server-tcp.conf <<EOF
 port $TCP_PORT
 proto tcp
@@ -98,25 +127,21 @@ key server.key
 dh dh.pem
 
 server 10.9.0.0 255.255.255.0
+server-ipv6 fd00:1234::/64
+
+push "redirect-gateway def1 ipv6 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS6 2620:119:35::35"
+push "dhcp-option DNS6 2606:4700:4700::1111"
+
 keepalive 10 120
 cipher AES-256-GCM
 auth SHA256
-
-push "redirect-gateway def1 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
-push "dhcp-option DNS 1.1.1.1"
-
 persist-key
 persist-tun
 verb 3
 EOF
-
-#----------- 开启 NAT -----------
-echo 1 >/proc/sys/net/ipv4/ip_forward
-sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-
-iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o $NIC -j MASQUERADE
-iptables-save >/etc/iptables/rules.v4
 
 #----------- 启动服务 -----------
 systemctl enable openvpn@server
@@ -138,8 +163,19 @@ auth SHA256
 auth-nocache
 resolv-retry infinite
 
-remote $PUB_IP $UDP_PORT udp
-remote $PUB_IP $TCP_PORT tcp
+remote $PUB_IP4 $UDP_PORT udp
+remote $PUB_IP4 $TCP_PORT tcp
+EOF
+
+# 自动加入 IPv6 远程
+if [[ $HAS_IPV6 -eq 1 ]]; then
+cat >>$CLIENT <<EOF
+remote $PUB_IP6 $UDP_PORT udp
+remote $PUB_IP6 $TCP_PORT tcp
+EOF
+fi
+
+cat >>$CLIENT <<EOF
 
 <ca>
 $(cat /etc/openvpn/ca.crt)
