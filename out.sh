@@ -1,109 +1,83 @@
 #!/bin/bash
-# ===============================================
-#  OpenVPN 出口服务器 自动部署脚本（安全版）
-#  绝不会影响入口服务器默认网关
-# ===============================================
+set -e
 
-echo "========== OpenVPN 出口服务器安装开始 =========="
+echo "============================"
+echo " OpenVPN 出口服务器自动部署 "
+echo "============================"
 
+# 1. 安装 OpenVPN + Easy-RSA
 apt update -y
-apt install openvpn easy-rsa sshpass -y
+apt install -y openvpn easy-rsa sshpass
 
-# -----------------------------------------------
-# 创建 Easy-RSA 目录
-# -----------------------------------------------
 make-cadir /etc/openvpn/easy-rsa
 cd /etc/openvpn/easy-rsa
 
-#-----------------------------
-# 初始化 PKI
-#-----------------------------
+# 2. 初始化 PKI
 ./easyrsa init-pki
-EASYRSA_BATCH=1 ./easyrsa build-ca nopass
+echo | ./easyrsa build-ca nopass
 
-#-----------------------------
-# 生成服务端证书
-#-----------------------------
-EASYRSA_BATCH=1 ./easyrsa gen-req server nopass
-EASYRSA_BATCH=1 ./easyrsa sign-req server server
+# 3. 生成服务端证书
+./easyrsa gen-req server nopass
+./easyrsa sign-req server server
 
-#-----------------------------
-# 生成客户端证书（client）
-#-----------------------------
-EASYRSA_BATCH=1 ./easyrsa gen-req client nopass
-EASYRSA_BATCH=1 ./easyrsa sign-req client client
-
-#-----------------------------
-# 生成 DH 参数
-#-----------------------------
+# 4. 生成 Diffie-Hellman
 ./easyrsa gen-dh
 
-#-----------------------------
-# 生成 TLS 密钥
-#-----------------------------
-openvpn --genkey secret /etc/openvpn/ta.key
+# 5. 生成客户端证书
+./easyrsa gen-req client nopass
+./easyrsa sign-req client client
 
-# 复制文件到 OpenVPN 目录
-cp pki/ca.crt pki/issued/server.crt pki/private/server.key \
-   pki/dh.pem /etc/openvpn/
+# 6. 复制证书到 /etc/openvpn
+cd /etc/openvpn
+cp easy-rsa/pki/ca.crt .
+cp easy-rsa/pki/issued/server.crt .
+cp easy-rsa/pki/private/server.key .
+cp easy-rsa/pki/dh.pem .
 
-# -----------------------------------------------
-# 写入服务端配置
-# -----------------------------------------------
-cat >/etc/openvpn/server.conf <<EOF
+# 7. 生成 server.conf
+cat > /etc/openvpn/server.conf <<EOF
 port 1194
 proto udp
 dev tun
+server 10.8.0.0 255.255.255.0
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 1.1.1.1"
+keepalive 10 120
+persist-key
+persist-tun
 ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
-auth SHA256
-tls-auth ta.key 0
-topology subnet
-server 10.8.0.0 255.255.255.0
-
-# 让入口服务器访问出口服务器所在的公网
-push "route 0.0.0.0 0.0.0.0"
-
-keepalive 10 120
-persist-key
-persist-tun
-duplicate-cn
+status openvpn-status.log
 verb 3
 EOF
 
-# -----------------------------
-# 开启 NAT
-# -----------------------------
-echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-openvpn.conf
-sysctl -p
-
-# NAT 规则
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$(ip route get 8.8.8.8 | awk '{print $5}')" -j MASQUERADE
-apt install iptables-persistent -y
-
-# -----------------------------
-# 启动 OpenVPN
-# -----------------------------
+# 8. 启动 OpenVPN
 systemctl enable openvpn@server
 systemctl restart openvpn@server
 
-# -----------------------------
-# 生成 client.ovpn
-# -----------------------------
-cat >/root/client.ovpn <<EOF
+echo "OpenVPN 出口服务器已启动!"
+
+出口IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
+echo "出口服务器外网IP: $出口IP"
+
+# 9. 创建客户端配置 client.ovpn
+cat > /root/client.ovpn <<EOF
 client
 dev tun
 proto udp
-remote $(curl -4 -s ifconfig.me) 1194
+remote $出口IP 1194
 resolv-retry infinite
 nobind
 persist-key
 persist-tun
+auth-nocache
 remote-cert-tls server
-auth SHA256
-key-direction 1
+redirect-gateway def1
+dhcp-option DNS 8.8.8.8
+dhcp-option DNS 1.1.1.1
 
 <ca>
 $(cat /etc/openvpn/ca.crt)
@@ -117,23 +91,25 @@ $(cat /etc/openvpn/easy-rsa/pki/issued/client.crt)
 $(cat /etc/openvpn/easy-rsa/pki/private/client.key)
 </key>
 
-<tls-auth>
-$(cat /etc/openvpn/ta.key)
-</tls-auth>
 EOF
 
-echo "========== 客户端文件已生成：/root/client.ovpn =========="
+echo ">>> 客户端配置文件: /root/client.ovpn"
 
-# -----------------------------
-# 上传 client.ovpn 到入口服务器
-# -----------------------------
-read -p "请输入入口服务器 IP: " INIP
-read -p "请输入入口服务器 SSH 用户名: " INUSER
-read -s -p "请输入入口服务器 SSH 密码: " INPASS
+echo ""
+echo "============================"
+echo " 请填写入口服务器 SSH 账号信息 "
+echo "============================"
+read -p "入口服务器 IP: " ENT_IP
+read -p "入口服务器 用户名: " ENT_USER
+read -p "入口服务器 密码: " ENT_PASS
+
+echo ">>> 正在上传 client.ovpn 到入口服务器 ..."
+sshpass -p "$ENT_PASS" scp -o StrictHostKeyChecking=no /root/client.ovpn $ENT_USER@$ENT_IP:/root/
+
+echo ""
+echo "上传成功！client.ovpn 已放到入口服务器 /root/"
 echo ""
 
-sshpass -p "$INPASS" scp -o StrictHostKeyChecking=no /root/client.ovpn ${INUSER}@${INIP}:/root/
-
-echo ">>> 上传完成！client.ovpn 已放到入口服务器的 /root/ 目录"
-
-echo "========== 出口服务器部署完成 =========="
+echo "============================"
+echo " OpenVPN 出口机部署成功！ "
+echo "============================"
