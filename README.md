@@ -14,6 +14,17 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-openg
 bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/memory.sh)
 ```
 
+# 出口部署
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/out.sh)
+```
+
+# 入口部署
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/in.sh)
+```
 # OpenGFW 一键清理工具
 
 ## 🚀 一键执行命令
