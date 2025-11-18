@@ -5,38 +5,38 @@
 复制下面命令即可一键运行RFW：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/rfw.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/rfw.sh)
 ```
 
 # 内存优化
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/memory.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/memory.sh)
 ```
 
 # 出口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/out.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/out.sh)
 ```
 
 # 入口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/in.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/main/in.sh)
 ```
 
-warp版
+## warp版
 # 出口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/warp-out.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/warp-out.sh)
 ```
 
 # 入口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/warp-in.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/warp-in.sh)
 ```
 # OpenGFW 一键清理工具
 
