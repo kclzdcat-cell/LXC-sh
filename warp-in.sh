@@ -1,138 +1,90 @@
 #!/bin/bash
-set -e
 clear
-echo "==========================================="
-echo "   OpenVPN 入口服务器安装脚本（IPv4 + IPv6）"
-echo "==========================================="
+echo "======================================"
+echo "  OpenVPN 入口服务器自动安装脚本 (IPv4 + IPv6)"
+echo "======================================"
 
-apt update -y
-apt install -y openvpn curl iptables-persistent
+############# 自动检测入口公网IP #############
+IN_IP4=$(curl -4 -s ip.sb || curl -4 -s ifconfig.me)
+IN_IP6=$(curl -6 -s ip.sb || echo "未检测到 IPv6")
 
-# 自动检测 IPv4 / IPv6（仅显示）
-IPV4=$(curl -s --max-time 3 ipv4.ip.sb || echo "")
-IPV6=$(curl -s --max-time 3 ipv6.ip.sb || echo "")
+echo -e "检测到入口服务器公网 IPv4: \e[32m$IN_IP4\e[0m"
+echo -e "检测到入口服务器公网 IPv6: \e[32m$IN_IP6\e[0m"
 
-echo ""
-echo "检测到入口服务器 IP："
-echo "  IPv4：${IPV4:-未检测到}"
-echo "  IPv6：${IPV6:-未检测到}"
-echo ""
+############# 自动检测出口网卡 #############
+IFACE=$(ip route get 1 | awk '{print $5; exit}')
+echo -e "\n自动检测到出口网卡: \e[32m$IFACE\e[0m"
 
-# 自动检测出口网卡
-NIC=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
-NIC=${NIC:-eth0}
+############# 获取出口服务器信息（手动输入） #############
+echo -e "\n请输入出口服务器 (已运行 out.sh) 的连接地址："
+read -p "出口服务器 IP/域名(可为IPv6)： " OUT_SERVER
 
-echo "自动检测到入口服务器出站网卡： $NIC"
-echo ""
+read -p "出口服务器 UDP 端口(默认 1194)： " OUT_UDP
+OUT_UDP=${OUT_UDP:-1194}
 
-# 用户输入出口服务器 IP
-echo "请输入出口服务器（已安装 out.sh）对外连接地址:"
-read -p "出口服务器 IP/域名（可为 IPv6）： " SERVER_IP
+read -p "出口服务器 TCP 端口(默认 443)： " OUT_TCP
+OUT_TCP=${OUT_TCP:-443}
 
-# 选择端口
-echo ""
-echo "出口服务器中已启用两个端口：UDP + TCP（在 out.sh 自动配置）"
-read -p "请输入出口服务器 UDP 端口（默认 1194 或 out.sh 分配的）： " UDP_PORT
-read -p "请输入出口服务器 TCP 端口（默认 443 或 out.sh 分配的）： " TCP_PORT
+echo -e "\n使用出站服务器："
+echo -e " IP: \e[32m$OUT_SERVER\e[0m"
+echo -e " UDP 协议: \e[32mudp6\e[0m (自动适配)"
+echo -e " TCP 协议: \e[32mtcp6\e[0m (自动适配，更稳定)"
+echo "======================================"
 
-UDP_PORT=${UDP_PORT:-1194}
-TCP_PORT=${TCP_PORT:-443}
-
-# 判断 IPv6
-if [[ "$SERVER_IP" == *":"* ]]; then
-    PROTO1="udp6"
-    PROTO2="tcp6"
-else
-    PROTO1="udp"
-    PROTO2="tcp"
-fi
-
-echo ""
-echo "使用出口 IP：$SERVER_IP"
-echo "UDP 协议：$PROTO1"
-echo "TCP 协议：$PROTO2"
-echo ""
-
-# 启用 IPv4/IPv6 转发
-echo 1 > /proc/sys/net/ipv4/ip_forward
-sed -i "s/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/" /etc/sysctl.conf
-
-# 如果支持 IPv6
-if [[ -n "$IPV6" ]]; then
-    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-    sed -i "s/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/" /etc/sysctl.conf
-fi
-
-sysctl -p >/dev/null 2>&1 || true
-
-# NAT 转发 IPv4
-iptables -t nat -A POSTROUTING -o $NIC -j MASQUERADE
-iptables-save >/etc/iptables/rules.v4
-
-# NAT 转发 IPv6（如果有 IPv6）
-if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -t nat -A POSTROUTING -o $NIC -j MASQUERADE || true
-    ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
-fi
-
-# 创建 OpenVPN 客户端配置
-mkdir -p /etc/openvpn/client
-cat >/etc/openvpn/client/client.conf <<EOF
-client
-dev tun
-nobind
-persist-key
-persist-tun
-
-# 出口服务器 UDP
-proto $PROTO1
-remote $SERVER_IP $UDP_PORT
-
-# 出口服务器 TCP
-proto $PROTO2
-remote $SERVER_IP $TCP_PORT
-
-remote-cert-tls server
-auth SHA256
-cipher AES-256-CBC
-verb 3
-
-# DNS
-script-security 2
-up /etc/openvpn/update-resolv-conf
-down /etc/openvpn/update-resolv-conf
-EOF
-
-# 等待用户已上传 client.ovpn
-echo ""
-echo "****************************************************"
-echo " 请现在把 出口服务器生成的 /root/client.ovpn 上传到："
-echo "     /etc/openvpn/client/"
-echo " 上传完成后，按回车继续。"
-echo "****************************************************"
-read -p ""
-
-if [[ ! -f /etc/openvpn/client/client.ovpn ]]; then
-    echo "错误：未找到 /etc/openvpn/client/client.ovpn"
+############# 检查 client.ovpn 是否存在 #############
+if [ ! -f /root/client.ovpn ]; then
+    echo -e "\e[31m未找到 /root/client.ovpn，请确认 out.sh 已上传配置文件！\e[0m"
     exit 1
 fi
 
-# 将 client.ovpn 的证书部分嵌入 client.conf
-echo "" >>/etc/openvpn/client/client.conf
-cat /etc/openvpn/client/client.ovpn >>/etc/openvpn/client/client.conf
+# 自动替换 remote 行
+echo ">>> 正在替换 client.ovpn 中的出口 IP 和端口 ..."
+sed -i "s/^remote .*/remote $OUT_SERVER $OUT_TCP tcp/" /root/client.ovpn
 
-# 启动 OpenVPN 客户端服务
-cp /etc/openvpn/client/client.conf /etc/openvpn/client.conf
-systemctl enable openvpn@client
-systemctl restart openvpn@client
+# 强制 IPv6 / IPv4 支持
+echo ">>> 添加 IPv6 / IPv4 支持 ..."
+grep -q "proto" /root/client.ovpn || echo "proto tcp" >> /root/client.ovpn
+grep -q "remote-cert-tls" /root/client.ovpn || echo "remote-cert-tls server" >> /root/client.ovpn
+
+############# 安装必要组件 #############
+apt update -y
+apt install -y openvpn iptables-persistent curl
+
+############# 启用 IPv4 / IPv6 转发 #############
+echo ">>> 开启 IPv4 IPv6 转发 ..."
+sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
+sed -i '/net.ipv6.conf.all.forwarding/d' /etc/sysctl.conf
+
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+sysctl -p
+
+############# 防火墙放行 #############
+echo ">>> 配置防火墙 NAT 转发 ..."
+
+# IPv4 NAT
+iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+iptables -A FORWARD -i tun0 -o $IFACE -j ACCEPT
+iptables -A FORWARD -i $IFACE -o tun0 -j ACCEPT
+
+# IPv6 NAT
+ip6tables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE 2>/dev/null
+ip6tables -A FORWARD -i tun0 -o $IFACE -j ACCEPT 2>/dev/null
+ip6tables -A FORWARD -i $IFACE -o tun0 -j ACCEPT 2>/dev/null
+
+netfilter-persistent save
+
+############# 启动 OpenVPN 客户端 #############
+echo ">>> 启动 OpenVPN 客户端 ..."
+mkdir -p /etc/openvpn/client
+cp /root/client.ovpn /etc/openvpn/client/client.conf
+
+systemctl enable openvpn-client@client.service
+systemctl restart openvpn-client@client.service
 
 sleep 2
-systemctl status openvpn@client --no-pager
+systemctl status openvpn-client@client.service --no-pager
 
-echo ""
-echo "=============================================="
-echo "OpenVPN 入口服务器 已经成功连接出口服务器！"
-echo "当前出口 IP："
-curl -s ipv4.ip.sb; echo
-curl -s ipv6.ip.sb; echo
-echo "=============================================="
+echo "======================================"
+echo -e "  \e[32mOpenVPN 入口服务器安装完成！\e[0m"
+echo "======================================"
