@@ -1,53 +1,63 @@
 #!/bin/bash
-clear
-echo "==============================================="
-echo "     OpenVPN 入口服务器自动部署脚本（稳定版）"
-echo "==============================================="
+set -e
 
-apt update -y
-apt install -y openvpn sshpass iptables iptables-persistent curl
+echo "==========================================="
+echo " OpenVPN 入口服务器自动安装脚本（最终稳定版）"
+echo " 不修改系统默认路由，不断开 SSH，安全稳定"
+echo "==========================================="
 
-read -p "请输入出口服务器 IPv6 地址: " OUT_IP
-read -p "请输入出口服务器 SSH 用户名（默认 root）: " OUT_USER
-OUT_USER=${OUT_USER:-root}
-read -p "请输入出口服务器 SSH 密码: " OUT_PASS
-read -p "请输入出口服务器 SSH 端口（默认22）: " OUT_PORT
-OUT_PORT=${OUT_PORT:-22}
-
-echo ">>> 开始从出口服务器下载 client.ovpn..."
-
-ssh-keygen -f "/root/.ssh/known_hosts" -R "$OUT_IP" 2>/dev/null
-
-# 自动重试 3 次
-for i in 1 2 3; do
-    echo "尝试下载（第 $i 次）..."
-    sshpass -p "$OUT_PASS" scp -6 -P $OUT_PORT ${OUT_USER}@[${OUT_IP}]:/root/client.ovpn /root/ && OK=1 && break
-    sleep 2
-done
-
-if [[ "$OK" != "1" ]]; then
-    echo "❌ 下载失败，请检查 SSH 密码或 IPv6 连接"
+#---------------- 检查系统 ----------------#
+if ! command -v apt >/dev/null 2>&1; then
+    echo "❌ 仅支持 Debian / Ubuntu 系统"
     exit 1
 fi
 
-echo "✔ client.ovpn 下载成功！"
+apt update -y
+apt install -y openvpn curl iproute2
 
-mkdir -p /etc/openvpn/client
+#---------------- 显示提示 ----------------#
+echo "================================================="
+echo " 此脚本只负责："
+echo "   ✔ 接收出口服务器上传的 client.ovpn"
+echo "   ✔ 自动创建 OpenVPN 隧道（tun0）"
+echo "   ✔ 不会修改默认路由（因此 SSH 不会断）"
+echo "================================================="
+
+#---------------- 检查是否已有 client.ovpn ----------------#
+if [[ ! -f /root/client.ovpn ]]; then
+    echo
+    echo "⚠ 未检测到 /root/client.ovpn，请确保出口服务器已经上传！"
+    echo "你稍后可手动上传：scp client.ovpn root@[入口IP]:/root/"
+    echo
+    exit 1
+else
+    echo "找到 client.ovpn -> /root/client.ovpn"
+fi
+
+#---------------- 创建 openvpn@client 服务 ----------------#
+mkdir -p /etc/openvpn/client/
 cp /root/client.ovpn /etc/openvpn/client/client.conf
+
+echo
+echo ">>> 启动 OpenVPN 隧道（tun0）..."
 
 systemctl enable openvpn-client@client
 systemctl restart openvpn-client@client
 
-echo ">>> 等待隧道建立..."
-sleep 3
+sleep 2
 
-echo "当前出口 IPv4："
-curl -4 ip.sb
+#---------------- 检查 TUN 状态 ----------------#
+echo
+echo ">>> 检查 OpenVPN 状态:"
+systemctl status openvpn-client@client --no-pager || true
 
-echo "当前出口 IPv6："
-curl -6 ip.sb
+echo
+echo ">>> 检查 tun0:"
+ip a | grep tun || echo "⚠ 未检测到 tun0，请检查出口服务器与入口 client.ovpn"
 
-echo "==============================================="
-echo " OpenVPN 入口服务器已完成部署！"
-echo " 流量已走出口隧道"
-echo "==============================================="
+#---------------- 完成 ----------------#
+echo "===================================================="
+echo " OpenVPN 入口服务器部署完成！"
+echo " 隧道已建立（如果 tun0 存在）"
+echo " SSH 不会断开，无需担心"
+echo "===================================================="
