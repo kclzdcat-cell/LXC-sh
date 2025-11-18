@@ -3,38 +3,28 @@ set -e
 
 echo "==========================================="
 echo " OpenVPN 出口服务器自动部署脚本（最终稳定版）"
-echo " 自动识别公网 IPv6（无需 curl）"
 echo " 完全兼容 OpenVPN 2.6+"
-echo " IPv4(若有)+IPv6, 自动 NAT, 自动上传 client.ovpn"
+echo " 自动识别公网 IPv6（不依赖 curl，不会失败）"
+echo " 只使用 IPv6 作为入口，IPv4 不写入（避免 10.x.x.x 和 WARP）"
+echo " IPv4+IPv6 NAT，自带 client.ovpn 自动上传"
 echo "==========================================="
 
 #======================================================
-#   自动检测公网 IPv6（无需 curl，绝不会失败）
+#   自动检测公网 IPv6（不依赖 curl，永不失败）
 #======================================================
-PUB_IP6=$(ip -6 addr show | grep global | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
+PUB_IP6=$(ip -6 addr show | grep global | grep -v temporary | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
 
 if [[ -z "$PUB_IP6" ]]; then
-    echo "❌ 未检测到公网 IPv6，这台服务器没有公网 IPv6，无法作为出口服务器！"
+    echo "❌ 未检测到公网 IPv6，此服务器不能作为出口服务器。"
     exit 1
 fi
 
-echo "检测到出口公网 IPv6: $PUB_IP6"
+echo "出口服务器公网 IPv6: $PUB_IP6"
 
 #======================================================
-#   自动检测 IPv4（仅当服务器有原生 IPv4 时）
+#   获取出口网卡
 #======================================================
-PUB_IP4=$(ip -4 addr show | grep global | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
-
-if [[ -n "$PUB_IP4" ]]; then
-    echo "检测到出口 IPv4（非 WARP 即可用）: $PUB_IP4"
-else
-    echo "检测不到原生 IPv4，将不写入 IPv4 remote（避免 WARP 垃圾 IP）"
-fi
-
-#======================================================
-#   检测出口网卡
-#======================================================
-NIC=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
 NIC=${NIC:-eth0}
 
 echo "检测到默认出口网卡: $NIC"
@@ -48,10 +38,9 @@ apt install -y openvpn easy-rsa sshpass iptables-persistent
 rm -rf /etc/openvpn/easy-rsa
 mkdir -p /etc/openvpn/easy-rsa
 cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
-
 cd /etc/openvpn/easy-rsa
-export EASYRSA_BATCH=1
 
+export EASYRSA_BATCH=1
 ./easyrsa init-pki
 ./easyrsa build-ca nopass
 ./easyrsa build-server-full server nopass
@@ -68,13 +57,13 @@ cp pki/private/client.key /etc/openvpn/
 cp ta.key /etc/openvpn/
 
 #======================================================
-#   固定端口（你原脚本的默认值）
+#   固定端口
 #======================================================
 UDP_PORT=1196
 TCP_PORT=443
 
-echo "使用 UDP: $UDP_PORT"
-echo "使用 TCP: $TCP_PORT"
+echo "使用 UDP 端口: $UDP_PORT"
+echo "使用 TCP 端口: $TCP_PORT"
 
 #======================================================
 #   启用 IPv4/IPv6 转发
@@ -82,21 +71,20 @@ echo "使用 TCP: $TCP_PORT"
 echo 1 >/proc/sys/net/ipv4/ip_forward
 sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
 
-echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
-sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
+echo 1 >/proc/sys/net/ipv6/conf/all/forwarding
+sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf
 
 #======================================================
-#   配置 NAT
+#   NAT 设置
 #======================================================
 iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -o $NIC -j MASQUERADE
-
 ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
 
 iptables-save >/etc/iptables/rules.v4
 ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
 
 #======================================================
-#   生成 server.conf（UDP）
+#   server.conf（UDP）
 #======================================================
 cat >/etc/openvpn/server.conf <<EOF
 port $UDP_PORT
@@ -122,7 +110,7 @@ verb 3
 EOF
 
 #======================================================
-#   生成 server-tcp.conf（TCP）
+#   server-tcp.conf（TCP）
 #======================================================
 cat >/etc/openvpn/server-tcp.conf <<EOF
 port $TCP_PORT
@@ -153,9 +141,10 @@ systemctl enable openvpn@server-tcp
 systemctl restart openvpn@server-tcp
 
 #======================================================
-#   生成 client.ovpn
+#   生成 client.ovpn（只写公网 IPv6）
 #======================================================
 CLIENT=/root/client.ovpn
+
 cat >$CLIENT <<EOF
 client
 dev tun
@@ -167,16 +156,7 @@ cipher AES-256-GCM
 auth SHA256
 auth-nocache
 resolv-retry infinite
-EOF
 
-if [[ -n "$PUB_IP4" ]]; then
-cat >>$CLIENT <<EOF
-remote $PUB_IP4 $UDP_PORT udp-client
-remote $PUB_IP4 $TCP_PORT tcp-client
-EOF
-fi
-
-cat >>$CLIENT <<EOF
 remote $PUB_IP6 $UDP_PORT udp-client
 remote $PUB_IP6 $TCP_PORT tcp-client
 
@@ -200,13 +180,13 @@ EOF
 echo "client.ovpn 已生成：/root/client.ovpn"
 
 #======================================================
-#   自动上传入口服务器
+#   自动上传 client.ovpn
 #======================================================
 echo
 echo "================= 上传 client.ovpn 到入口服务器 ================="
 echo
 
-read -p "入口服务器 IP（支持 IPv4/IPv6）： " IN_IP
+read -p "入口服务器 IP（IPv4/IPv6）： " IN_IP
 read -p "入口 SSH 端口（默认 22）： " IN_PORT
 IN_PORT=${IN_PORT:-22}
 read -p "入口 SSH 用户（默认 root）： " IN_USER
@@ -217,11 +197,11 @@ ssh-keygen -R "$IN_IP" >/dev/null 2>&1 || true
 
 for i in 1 2 3; do
     echo "第 $i 次上传..."
-    if sshpass -p "$IN_PASS" scp -6 -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT $IN_USER@[$IN_IP]:/root/ 2>/dev/null; then
+    if sshpass -p "$IN_PASS" scp -6 -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT ${IN_USER}@[$IN_IP]:/root/ 2>/dev/null; then
         echo "上传成功（IPv6）！"
         break
     fi
-    if sshpass -p "$IN_PASS" scp -4 -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT $IN_USER@$IN_IP:/root/ 2>/dev/null; then
+    if sshpass -p "$IN_PASS" scp -4 -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT ${IN_USER}@$IN_IP:/root/ 2>/dev/null; then
         echo "上传成功（IPv4）！"
         break
     fi
