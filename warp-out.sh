@@ -7,29 +7,43 @@ echo " 完全兼容 OpenVPN 2.6+"
 echo " IPv4 + IPv6 双栈, 自动 NAT, 自动上传 client.ovpn"
 echo "==========================================="
 
-#---------------------- 检测出口 IPv4 / IPv6（新增格式校验） ----------------------#
-RAW_IP4=$(curl -4 -s ipv4.ip.sb || curl -4 -s ifconfig.me || true)
-RAW_IP6=$(curl -6 -s ipv6.ip.sb || true)
+#======================================================
+#   获取有效 IPv4 / IPv6（若无效不写入）
+#======================================================
+RAW_IP4=$(curl -4 -s ipv4.ip.sb 2>/dev/null || true)
+RAW_IP6=$(curl -6 -s ipv6.ip.sb 2>/dev/null || true)
 
-# 合法 IPv4 格式：x.x.x.x
-PUB_IP4=$(echo "$RAW_IP4" | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$')
-# 合法 IPv6 格式
-PUB_IP6=$(echo "$RAW_IP6" | grep -Eo '^([0-9a-fA-F:]+:+)+[0-9a-fA-F]+$')
+# IPv4 正则
+PUB_IP4=$(echo "$RAW_IP4" | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)
+
+# IPv6 正则
+PUB_IP6=$(echo "$RAW_IP6" | grep -Eo '^([0-9a-fA-F:]+:+)+[0-9a-fA-F]+$' || true)
 
 echo "检测到出口 IPv4: ${PUB_IP4:-无有效 IPv4}"
 echo "检测到出口 IPv6: ${PUB_IP6:-无有效 IPv6}"
 
-#（保持原来的网卡检测）
-NIC=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+if [[ -z "$PUB_IP4" && -z "$PUB_IP6" ]]; then
+    echo "❌ 无任何有效公网IP，脚本终止。"
+    exit 1
+fi
+
+#======================================================
+#   获取默认外网网卡
+#======================================================
+NIC=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+NIC=${NIC:-eth0}
 echo "检测到默认出口网卡: $NIC"
 
 apt update -y
 apt install -y openvpn easy-rsa sshpass iptables-persistent curl
 
-#---------------------- 重建 PKI ----------------------#
+#======================================================
+#   构建 PKI
+#======================================================
 rm -rf /etc/openvpn/easy-rsa
 mkdir -p /etc/openvpn/easy-rsa
 cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
+
 cd /etc/openvpn/easy-rsa
 export EASYRSA_BATCH=1
 
@@ -48,7 +62,9 @@ cp pki/issued/client.crt /etc/openvpn/
 cp pki/private/client.key /etc/openvpn/
 cp ta.key /etc/openvpn/
 
-#---------------------- 查找空闲端口 ----------------------#
+#======================================================
+#   查找空闲端口
+#======================================================
 find_free_port() {
   p=$1
   while ss -tuln | grep -q ":$p\b"; do
@@ -63,14 +79,18 @@ TCP_PORT=$(find_free_port 443)
 echo "使用 UDP 端口: $UDP_PORT"
 echo "使用 TCP 端口: $TCP_PORT"
 
-#---------------------- 开启 IPv4/IPv6 转发 ----------------------#
+#======================================================
+#   启用 IPv4/IPv6 转发
+#======================================================
 echo 1 >/proc/sys/net/ipv4/ip_forward
 sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
 
 echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
 sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
 
-#---------------------- NAT ----------------------#
+#======================================================
+#   IPv4 / IPv6 NAT
+#======================================================
 iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -o $NIC -j MASQUERADE
 
 if [[ -n "$PUB_IP6" ]]; then
@@ -80,26 +100,24 @@ fi
 iptables-save >/etc/iptables/rules.v4
 ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
 
-#---------------------- server.conf（UDP） ----------------------#
+#======================================================
+#   生成 server.conf（UDP）
+#======================================================
 cat >/etc/openvpn/server.conf <<EOF
 port $UDP_PORT
 proto udp
 dev tun
 topology subnet
-
 ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
 tls-crypt ta.key
-
 server 10.8.0.0 255.255.255.0
 server-ipv6 fd00:1234::/64
-
 push "redirect-gateway def1 ipv6 bypass-dhcp"
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS6 2606:4700:4700::1111"
-
 cipher AES-256-GCM
 auth SHA256
 persist-key
@@ -108,26 +126,24 @@ explicit-exit-notify 1
 verb 3
 EOF
 
-#---------------------- server-tcp.conf（TCP） ----------------------#
+#======================================================
+#   生成 server-tcp.conf（TCP）
+#======================================================
 cat >/etc/openvpn/server-tcp.conf <<EOF
 port $TCP_PORT
 proto tcp
 dev tun
 topology subnet
-
 ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
 tls-crypt ta.key
-
 server 10.9.0.0 255.255.255.0
 server-ipv6 fd00:1234::/64
-
 push "redirect-gateway def1 ipv6 bypass-dhcp"
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS6 2606:4700:4700::1111"
-
 cipher AES-256-GCM
 auth SHA256
 persist-key
@@ -137,10 +153,13 @@ EOF
 
 systemctl enable openvpn@server
 systemctl restart openvpn@server
+
 systemctl enable openvpn@server-tcp
 systemctl restart openvpn@server-tcp
 
-#---------------------- 生成 client.ovpn（关键：不写入无效 IP） ----------------------#
+#======================================================
+#   生成 client.ovpn（只写入合法 IP，绝不写 error code）
+#======================================================
 CLIENT=/root/client.ovpn
 cat >$CLIENT <<EOF
 client
@@ -155,7 +174,6 @@ auth-nocache
 resolv-retry infinite
 EOF
 
-# ---- IPv4(remote) 只有合法 IPv4 才写入 ----
 if [[ -n "$PUB_IP4" ]]; then
 cat >>$CLIENT <<EOF
 remote $PUB_IP4 $UDP_PORT udp-client
@@ -163,7 +181,6 @@ remote $PUB_IP4 $TCP_PORT tcp-client
 EOF
 fi
 
-# ---- IPv6(remote) 只有合法 IPv6 才写入 ----
 if [[ -n "$PUB_IP6" ]]; then
 cat >>$CLIENT <<EOF
 remote $PUB_IP6 $UDP_PORT udp-client
@@ -171,7 +188,6 @@ remote $PUB_IP6 $TCP_PORT tcp-client
 EOF
 fi
 
-# ---- 证书部分 ----
 cat >>$CLIENT <<EOF
 
 <ca>
@@ -193,7 +209,9 @@ EOF
 
 echo "client.ovpn 已生成：/root/client.ovpn"
 
-#---------------------- 上传 client.ovpn 到入口服务器 ----------------------#
+#======================================================
+#   上传 client.ovpn
+#======================================================
 echo
 echo "================= 上传 client.ovpn 到入口服务器 ================="
 echo
