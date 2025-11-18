@@ -7,14 +7,19 @@ echo " 完全兼容 OpenVPN 2.6+"
 echo " IPv4 + IPv6 双栈, 自动 NAT, 自动上传 client.ovpn"
 echo "==========================================="
 
-#---------------------- 检测出口 IPv4 / IPv6 ----------------------#
-PUB_IP4=$(curl -4 -s ipv4.ip.sb || curl -4 -s ifconfig.me || true)
-PUB_IP6=$(curl -6 -s ipv6.ip.sb || true)
+#---------------------- 检测出口 IPv4 / IPv6（新增格式校验） ----------------------#
+RAW_IP4=$(curl -4 -s ipv4.ip.sb || curl -4 -s ifconfig.me || true)
+RAW_IP6=$(curl -6 -s ipv6.ip.sb || true)
 
-echo "检测到出口 IPv4: ${PUB_IP4:-无}"
-echo "检测到出口 IPv6: ${PUB_IP6:-无}"
+# 合法 IPv4 格式：x.x.x.x
+PUB_IP4=$(echo "$RAW_IP4" | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+# 合法 IPv6 格式
+PUB_IP6=$(echo "$RAW_IP6" | grep -Eo '^([0-9a-fA-F:]+:+)+[0-9a-fA-F]+$')
 
-#---------------------- 检测出口网卡 ----------------------#
+echo "检测到出口 IPv4: ${PUB_IP4:-无有效 IPv4}"
+echo "检测到出口 IPv6: ${PUB_IP6:-无有效 IPv6}"
+
+#（保持原来的网卡检测）
 NIC=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 echo "检测到默认出口网卡: $NIC"
 
@@ -28,24 +33,13 @@ cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
 cd /etc/openvpn/easy-rsa
 export EASYRSA_BATCH=1
 
-echo ">>> 初始化 PKI ..."
 ./easyrsa init-pki
-
-echo ">>> 生成 CA ..."
 ./easyrsa build-ca nopass
-
-echo ">>> 生成服务器证书 ..."
 ./easyrsa build-server-full server nopass
-
-echo ">>> 生成客户端证书 ..."
 ./easyrsa build-client-full client nopass
-
-echo ">>> 生成 DH 参数 ..."
 ./easyrsa gen-dh
-
 openvpn --genkey secret ta.key
 
-#---------------------- 拷贝证书 ----------------------#
 cp pki/ca.crt /etc/openvpn/
 cp pki/dh.pem /etc/openvpn/
 cp pki/issued/server.crt /etc/openvpn/
@@ -69,18 +63,17 @@ TCP_PORT=$(find_free_port 443)
 echo "使用 UDP 端口: $UDP_PORT"
 echo "使用 TCP 端口: $TCP_PORT"
 
-#---------------------- 启用 IPv4/IPv6 转发 ----------------------#
+#---------------------- 开启 IPv4/IPv6 转发 ----------------------#
 echo 1 >/proc/sys/net/ipv4/ip_forward
 sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
 
 echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
 sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
 
-#---------------------- 配置 NAT ----------------------#
+#---------------------- NAT ----------------------#
 iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -o $NIC -j MASQUERADE
 
 if [[ -n "$PUB_IP6" ]]; then
-    echo "检测到 IPv6, 启用 IPv6 NAT"
     ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
 fi
 
@@ -92,7 +85,6 @@ cat >/etc/openvpn/server.conf <<EOF
 port $UDP_PORT
 proto udp
 dev tun
-
 topology subnet
 
 ca ca.crt
@@ -112,7 +104,6 @@ cipher AES-256-GCM
 auth SHA256
 persist-key
 persist-tun
-
 explicit-exit-notify 1
 verb 3
 EOF
@@ -122,7 +113,6 @@ cat >/etc/openvpn/server-tcp.conf <<EOF
 port $TCP_PORT
 proto tcp
 dev tun
-
 topology subnet
 
 ca ca.crt
@@ -142,18 +132,15 @@ cipher AES-256-GCM
 auth SHA256
 persist-key
 persist-tun
-
 verb 3
 EOF
 
-#---------------------- 启动 OpenVPN ----------------------#
 systemctl enable openvpn@server
 systemctl restart openvpn@server
-
 systemctl enable openvpn@server-tcp
 systemctl restart openvpn@server-tcp
 
-#---------------------- 生成 client.ovpn ----------------------#
+#---------------------- 生成 client.ovpn（关键：不写入无效 IP） ----------------------#
 CLIENT=/root/client.ovpn
 cat >$CLIENT <<EOF
 client
@@ -166,12 +153,17 @@ cipher AES-256-GCM
 auth SHA256
 auth-nocache
 resolv-retry infinite
+EOF
 
+# ---- IPv4(remote) 只有合法 IPv4 才写入 ----
+if [[ -n "$PUB_IP4" ]]; then
+cat >>$CLIENT <<EOF
 remote $PUB_IP4 $UDP_PORT udp-client
 remote $PUB_IP4 $TCP_PORT tcp-client
 EOF
+fi
 
-# 如检测到 IPv6 则加入 IPv6 远程
+# ---- IPv6(remote) 只有合法 IPv6 才写入 ----
 if [[ -n "$PUB_IP6" ]]; then
 cat >>$CLIENT <<EOF
 remote $PUB_IP6 $UDP_PORT udp-client
@@ -179,6 +171,7 @@ remote $PUB_IP6 $TCP_PORT tcp-client
 EOF
 fi
 
+# ---- 证书部分 ----
 cat >>$CLIENT <<EOF
 
 <ca>
