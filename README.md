@@ -38,6 +38,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/war
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/warp-in.sh)
 ```
+
+# 出口流量走tun0网卡部署
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/tun0.sh)
+```
 # OpenGFW 一键清理工具
 
 ## 🚀 一键执行命令
