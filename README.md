@@ -5,38 +5,38 @@
 复制下面命令即可一键运行RFW：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/rfw.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/rfw.sh)
 ```
 
 # 内存优化
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/memory.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/memory.sh)
 ```
 
 # 出口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/out.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/out.sh)
 ```
 
 # 入口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/main/in.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/main/in.sh)
 ```
 
 ## warp版
 # 出口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/warp-out.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/warp-out.sh)
 ```
 
 # 入口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/edit/main/warp-in.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/warp-in.sh)
 ```
 # OpenGFW 一键清理工具
 
