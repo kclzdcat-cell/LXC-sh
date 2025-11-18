@@ -1,129 +1,164 @@
 #!/bin/bash
-set -e
 
-echo "============================================"
-echo "  OpenVPN 出口服务器自动部署脚本（IPv6 入站）"
-echo "============================================"
+clear
+echo "====================================="
+echo "   OpenVPN 出口服务器自动部署脚本"
+echo "    IPv6 入站 + WARP IPv4 出站"
+echo "====================================="
 
+########################################
+# 1. 系统检测
+########################################
+if ! command -v apt >/dev/null 2>&1; then
+    echo "❌ 本脚本仅支持 Debian / Ubuntu 系统！"
+    exit 1
+fi
+
+########################################
+# 2. 更新系统 & 安装依赖
+########################################
+echo ">>> 更新系统 & 安装依赖"
 apt update -y
-apt install -y openvpn easy-rsa iptables iptables-persistent curl
+apt install -y openvpn easy-rsa curl unzip iptables iptables-persistent
 
-# ==========================================================
-#   自动检测出口网卡名称（绝对不会把 IPv6 当网卡名）
-# ==========================================================
-NIC=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+########################################
+# 3. 自动获取出口服务器 IPv6
+########################################
+OUT_IPV6=$(ip -6 addr show | grep global | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+IFACE=$(ip -6 addr show | grep global | awk '{print $NF}' | head -n 1)
 
-if [ -z "$NIC" ]; then
-    NIC=$(ip -6 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+if [[ -z "$OUT_IPV6" ]]; then
+    echo "❌ 无法找到出口服务器公网 IPv6！"
+    exit 1
 fi
 
-if [[ "$NIC" =~ ^(lo|tun|docker|vnet) ]]; then
-    NIC=$(ip -o link show | awk -F': ' '{print $2}' | grep -vE "lo|tun|docker|vnet" | head -n1)
-fi
+echo "出口 IPv6: $OUT_IPV6"
+echo "出口网卡: $IFACE"
 
-echo "出口网卡检测结果：$NIC"
+########################################
+# 4. 初始化 Easy-RSA
+########################################
+echo ">>> 初始化 Easy-RSA"
 
-# ==========================================================
-#  Easy-RSA 初始化
-# ==========================================================
-EASYRSA=/etc/openvpn/easy-rsa
-rm -rf $EASYRSA
-make-cadir $EASYRSA
-cd $EASYRSA
+EASY=/etc/openvpn/easy-rsa
+rm -rf $EASY
+mkdir -p $EASY
+cp -r /usr/share/easy-rsa/* $EASY
+cd $EASY
 ./easyrsa init-pki
-echo -en "\n" | ./easyrsa build-ca nopass
+echo "server" | ./easyrsa build-ca nopass
 ./easyrsa gen-dh
 ./easyrsa build-server-full server nopass
 ./easyrsa build-client-full client nopass
 
-# ==========================================================
-#  生成 server.conf
-# ==========================================================
+########################################
+# 5. 创建 server.conf
+########################################
+echo ">>> 生成 server.conf"
+
 cat >/etc/openvpn/server.conf <<EOF
 port 1194
-proto udp
+proto tcp6
 dev tun
 
-ca $EASYRSA/pki/ca.crt
-cert $EASYRSA/pki/issued/server.crt
-key $EASYRSA/pki/private/server.key
-dh $EASYRSA/pki/dh.pem
-
 server 10.8.0.0 255.255.255.0
-push "redirect-gateway def1 bypass-dhcp"
-push "dhcp-option DNS 1.1.1.1"
+
+push "redirect-gateway def1 ipv6 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+
+ca $EASY/pki/ca.crt
+cert $EASY/pki/issued/server.crt
+key $EASY/pki/private/server.key
+dh $EASY/pki/dh.pem
 
 keepalive 10 120
 persist-key
 persist-tun
+
+status /var/log/openvpn-status.log
 verb 3
-explicit-exit-notify 1
 EOF
 
+########################################
+# 6. 启动 OpenVPN
+########################################
 systemctl enable openvpn@server
 systemctl restart openvpn@server
 
-sleep 2
+########################################
+# 7. 创建 client.ovpn
+########################################
+echo ">>> 生成 client.ovpn"
 
-# ==========================================================
-#  NAT（使用正确网卡）
-# ==========================================================
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $NIC -j MASQUERADE
-netfilter-persistent save
-
-# ==========================================================
-#  获取 IPv6（不会误判）
-# ==========================================================
-SERVER_IPV6=$(ip -6 addr show $NIC | awk '/scope global/ {print $2}' | head -n1 | cut -d/ -f1)
-echo "检测到出口 IPv6：$SERVER_IPV6"
-
-# ==========================================================
-#  生成 client.ovpn
-# ==========================================================
 cat >/root/client.ovpn <<EOF
 client
 dev tun
-proto udp
-remote $SERVER_IPV6 1194
+proto tcp6
+remote $OUT_IPV6 1194
+resolv-retry infinite
 nobind
+
 persist-key
 persist-tun
-remote-cert-tls server
-verb 3
 
 <ca>
-$(cat $EASYRSA/pki/ca.crt)
+$(cat $EASY/pki/ca.crt)
 </ca>
 
 <cert>
-$(sed -n '/BEGIN/,/END/p' $EASYRSA/pki/issued/client.crt)
+$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' $EASY/pki/issued/client.crt)
 </cert>
 
 <key>
-$(cat $EASYRSA/pki/private/client.key)
+$(cat $EASY/pki/private/client.key)
 </key>
 EOF
 
-echo "出口配置文件生成：/root/client.ovpn"
+echo "client.ovpn 已生成： /root/client.ovpn"
 
-# ==========================================================
-#  自动上传
-# ==========================================================
+########################################
+# 8. 上传到入口服务器
+########################################
 read -p "是否上传 client.ovpn 到入口服务器？(y/n): " UP
 
-if [[ "$UP" == "y" ]]; then
-    apt install -y sshpass
-    read -p "入口服务器 IP: " INIP
-    read -p "入口 SSH 端口(默认22): " INPORT
-    INPORT=${INPORT:-22}
-    read -p "入口用户(默认 root): " INUSER
-    INUSER=${INUSER:-root}
-    read -p "入口密码: " INPASS
+if [[ "$UP" == "y" || "$UP" == "Y" ]]; then
 
-    ssh-keygen -R "[$INIP]:$INPORT" 2>/dev/null || true
+    read -p "入口服务器 IP (支持 IPv4 / IPv6): " INIP
+    read -p "入口 SSH 端口(默认22): " SSH_PORT
+    SSH_PORT=${SSH_PORT:-22}
+    read -p "入口 SSH 用户(默认 root): " SSH_USER
+    SSH_USER=${SSH_USER:-root}
+    read -p "入口 密码: " SSH_PASS
 
-    sshpass -p "$INPASS" scp -P $INPORT /root/client.ovpn $INUSER@$INIP:/root/
-    echo "上传成功！"
+    echo ">>> 清理入口机 known_hosts 冲突"
+    ssh-keygen -f "/root/.ssh/known_hosts" -R "$INIP" >/dev/null 2>&1
+
+    echo ">>> 等待入口机 SSH 稳定...（3秒）"
+    sleep 3
+
+    # 识别 IPv6
+    if [[ "$INIP" == *":"* ]]; then
+        TARGET="[$INIP]"
+    else
+        TARGET="$INIP"
+    fi
+
+    echo ">>> 开始上传（自动重试 3 次）"
+
+    for i in 1 2 3; do
+        sshpass -p "$SSH_PASS" scp -P "$SSH_PORT" /root/client.ovpn ${SSH_USER}@${TARGET}:/root/
+        if [[ $? -eq 0 ]]; then
+            echo "✅ 上传成功！"
+            exit 0
+        else
+            echo "⚠️ 第 $i 次上传失败，1 秒后重试..."
+            sleep 1
+        fi
+    done
+
+    echo "❌ 上传失败（尝试 3 次仍未成功）"
 fi
 
-echo "出口服务器部署完成！"
+echo "==============================="
+echo " OpenVPN 出口服务器部署完成！"
+echo "==============================="
