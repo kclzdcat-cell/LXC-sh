@@ -1,13 +1,13 @@
 #!/bin/bash
 clear
 echo "=========================================="
-echo "  OpenVPN 入口服务器安装脚本（仅建立隧道，不改路由）"
+echo "  OpenVPN 入口服务器安装脚本（不会修改路由，不会断开 SSH）"
 echo "=========================================="
 
 ### 自动检测系统
 if [ -f /etc/debian_version ]; then
     apt update -y
-    apt install -y curl wget iproute2 openvpn iptables iptables-persistent
+    apt install -y curl wget iproute2 openvpn
 else
     echo "不支持的系统"
     exit 1
@@ -19,17 +19,25 @@ if [ ! -f /root/client.ovpn ]; then
     exit 1
 fi
 
-### 创建 OpenVPN client 配置
-cp /root/client.ovpn /etc/openvpn/client.conf
+### 写入 OpenVPN 客户端配置（禁止路由变更）
+mkdir -p /etc/openvpn
+cat >/etc/openvpn/client.conf <<EOF
+$(cat /root/client.ovpn)
 
-### 不要 push 路由，不改变默认出口，由入口服务器保持本地 IPv4 出站
-### 只建立隧道用于远端 NAT
+### ===== 强制禁止任何路由修改，避免 SSH 掉线 =====
+route-noexec
+pull-filter ignore redirect-gateway
+pull-filter ignore "route "
+pull-filter ignore "dhcp-option"
+EOF
 
 ### 启动 OpenVPN 客户端
 systemctl enable openvpn@client
 systemctl restart openvpn@client
 
 echo "=========================================="
-echo " 入口服务器 OpenVPN 隧道已建立！"
-echo " 请使用：ip a  查看 tun0 状态"
+echo "入口服务器 OpenVPN 隧道已建立"
+echo "SSH 不会断开，无需担心！"
+echo "查看状态：systemctl status openvpn@client"
+echo "查看隧道：ip a | grep tun"
 echo "=========================================="
