@@ -3,39 +3,44 @@ set -e
 
 echo "==========================================="
 echo " OpenVPN 出口服务器自动部署脚本（最终稳定版）"
+echo " 自动识别公网 IPv6（无需 curl）"
 echo " 完全兼容 OpenVPN 2.6+"
-echo " IPv4 + IPv6 双栈, 自动 NAT, 自动上传 client.ovpn"
+echo " IPv4(若有)+IPv6, 自动 NAT, 自动上传 client.ovpn"
 echo "==========================================="
 
 #======================================================
-#   获取有效 IPv4 / IPv6（若无效不写入）
+#   自动检测公网 IPv6（无需 curl，绝不会失败）
 #======================================================
-RAW_IP4=$(curl -4 -s ipv4.ip.sb 2>/dev/null || true)
-RAW_IP6=$(curl -6 -s ipv6.ip.sb 2>/dev/null || true)
+PUB_IP6=$(ip -6 addr show | grep global | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
 
-# IPv4 正则
-PUB_IP4=$(echo "$RAW_IP4" | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)
-
-# IPv6 正则
-PUB_IP6=$(echo "$RAW_IP6" | grep -Eo '^([0-9a-fA-F:]+:+)+[0-9a-fA-F]+$' || true)
-
-echo "检测到出口 IPv4: ${PUB_IP4:-无有效 IPv4}"
-echo "检测到出口 IPv6: ${PUB_IP6:-无有效 IPv6}"
-
-if [[ -z "$PUB_IP4" && -z "$PUB_IP6" ]]; then
-    echo "❌ 无任何有效公网IP，脚本终止。"
+if [[ -z "$PUB_IP6" ]]; then
+    echo "❌ 未检测到公网 IPv6，这台服务器没有公网 IPv6，无法作为出口服务器！"
     exit 1
 fi
 
+echo "检测到出口公网 IPv6: $PUB_IP6"
+
 #======================================================
-#   获取默认外网网卡
+#   自动检测 IPv4（仅当服务器有原生 IPv4 时）
+#======================================================
+PUB_IP4=$(ip -4 addr show | grep global | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
+
+if [[ -n "$PUB_IP4" ]]; then
+    echo "检测到出口 IPv4（非 WARP 即可用）: $PUB_IP4"
+else
+    echo "检测不到原生 IPv4，将不写入 IPv4 remote（避免 WARP 垃圾 IP）"
+fi
+
+#======================================================
+#   检测出口网卡
 #======================================================
 NIC=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
 NIC=${NIC:-eth0}
+
 echo "检测到默认出口网卡: $NIC"
 
 apt update -y
-apt install -y openvpn easy-rsa sshpass iptables-persistent curl
+apt install -y openvpn easy-rsa sshpass iptables-persistent
 
 #======================================================
 #   构建 PKI
@@ -63,21 +68,13 @@ cp pki/private/client.key /etc/openvpn/
 cp ta.key /etc/openvpn/
 
 #======================================================
-#   查找空闲端口
+#   固定端口（你原脚本的默认值）
 #======================================================
-find_free_port() {
-  p=$1
-  while ss -tuln | grep -q ":$p\b"; do
-    p=$((p+1))
-  done
-  echo $p
-}
+UDP_PORT=1196
+TCP_PORT=443
 
-UDP_PORT=$(find_free_port 1194)
-TCP_PORT=$(find_free_port 443)
-
-echo "使用 UDP 端口: $UDP_PORT"
-echo "使用 TCP 端口: $TCP_PORT"
+echo "使用 UDP: $UDP_PORT"
+echo "使用 TCP: $TCP_PORT"
 
 #======================================================
 #   启用 IPv4/IPv6 转发
@@ -89,13 +86,11 @@ echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
 sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
 
 #======================================================
-#   IPv4 / IPv6 NAT
+#   配置 NAT
 #======================================================
 iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -o $NIC -j MASQUERADE
 
-if [[ -n "$PUB_IP6" ]]; then
-    ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
-fi
+ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
 
 iptables-save >/etc/iptables/rules.v4
 ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
@@ -158,7 +153,7 @@ systemctl enable openvpn@server-tcp
 systemctl restart openvpn@server-tcp
 
 #======================================================
-#   生成 client.ovpn（只写入合法 IP，绝不写 error code）
+#   生成 client.ovpn
 #======================================================
 CLIENT=/root/client.ovpn
 cat >$CLIENT <<EOF
@@ -181,14 +176,9 @@ remote $PUB_IP4 $TCP_PORT tcp-client
 EOF
 fi
 
-if [[ -n "$PUB_IP6" ]]; then
 cat >>$CLIENT <<EOF
 remote $PUB_IP6 $UDP_PORT udp-client
 remote $PUB_IP6 $TCP_PORT tcp-client
-EOF
-fi
-
-cat >>$CLIENT <<EOF
 
 <ca>
 $(cat /etc/openvpn/ca.crt)
@@ -210,7 +200,7 @@ EOF
 echo "client.ovpn 已生成：/root/client.ovpn"
 
 #======================================================
-#   上传 client.ovpn
+#   自动上传入口服务器
 #======================================================
 echo
 echo "================= 上传 client.ovpn 到入口服务器 ================="
