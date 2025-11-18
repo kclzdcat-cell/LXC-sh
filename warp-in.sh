@@ -1,36 +1,47 @@
 #!/bin/bash
-clear
+# OpenVPN 入口服务器（客户端）安装脚本
+# 适用：Debian / Ubuntu
 
-echo "==============================================="
-echo "  OpenVPN 入口服务器安装脚本 (IPv4 + IPv6)"
-echo "==============================================="
+yellow(){ echo -e "\033[33m$1\033[0m"; }
+green(){ echo -e "\033[32m$1\033[0m"; }
+red(){ echo -e "\033[31m$1\033[0m"; }
+
+echo "============================================="
+echo " OpenVPN 入口服务器自动部署脚本（IPv4 + IPv6）"
+echo "============================================="
+
+sleep 1
 
 apt update -y
-apt install -y openvpn curl
+apt install -y openvpn iptables-persistent curl
 
-# 自动检测 IPv4/IPv6
-IP4=$(curl -4 -s ip.sb)
-IP6=$(curl -6 -s ip.sb)
+#---------------------------
+# 网络转发
+#---------------------------
+cat >/etc/sysctl.d/99-openvpn.conf <<EOF
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+sysctl -p /etc/sysctl.d/99-openvpn.conf
 
-echo "入口 IPv4: $IP4"
-echo "入口 IPv6: ${IP6:-未检测到}"
+#---------------------------
+# 防火墙 NAT
+#---------------------------
+NIC=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1)
 
-# 自动检测出站网卡
-WAN_IF=$(ip route get 1 | awk '{print $5; exit}')
-echo "入口机出站网卡: $WAN_IF"
+iptables -t nat -A POSTROUTING -o "$NIC" -j MASQUERADE
+netfilter-persistent save
 
-# 获取出口服务器 IPv6：由用户输入
-read -p "请输入出口服务器 IPv6 地址: " OUTIPV6
-
-# 创建 OpenVPN 客户端配置
-mkdir -p /etc/openvpn/client
+#---------------------------
+# 启动 OpenVPN 客户端
+#---------------------------
+mkdir -p /etc/openvpn/client/
 cp /root/client.ovpn /etc/openvpn/client/client.conf
 
-# 启动 UDP 客户端
 systemctl enable openvpn-client@client
-systemctl start openvpn-client@client
+systemctl restart openvpn-client@client
 
-echo
-echo "============================="
-echo " OpenVPN 入口服务器安装完成！"
-echo "============================="
+green "入口服务器已成功连接到出口服务器！"
+
+echo "当前出口 IP："
+curl -4 ip.sb
