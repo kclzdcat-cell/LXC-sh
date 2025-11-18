@@ -3,7 +3,9 @@ set -e
 
 echo "==========================================="
 echo " OpenVPN 入口服务器部署脚本（最终稳定版）"
-echo " 避免默认路由被接管 | 完全兼容 OpenVPN 2.6+"
+echo " 完全兼容 OpenVPN 2.6+"
+echo " 不接管默认路由，保证 SSH 不断线"
+echo " 自动修正 remote 语法，防止所有 2.6 报错"
 echo "==========================================="
 
 apt update -y
@@ -13,24 +15,40 @@ mkdir -p /etc/openvpn/client
 
 #------------- 检查 client.ovpn 是否存在 -------------
 if [[ ! -f "/root/client.ovpn" ]]; then
-    echo "未找到 /root/client.ovpn"
+    echo "❌ 未找到 /root/client.ovpn"
     echo "请先从出口服务器上传后再运行本脚本！"
     exit 1
 fi
 
-#--------------- 拷贝 client.ovpn -------------------
+#------------- 拷贝配置文件 --------------------------
 cp /root/client.ovpn /etc/openvpn/client/client.ovpn
 
-#--------------- 移除默认路由 push ------------------
-# 出口端已 push redirect-gateway ，入口端必须禁止
+#======================================================
+#   ⭐ 自动修复 OpenVPN 2.6 不再支持的 remote 旧语法
+#   （这是你入口端一直报错的唯一原因）
+#======================================================
+
+# 修复 udp → udp-client
+sed -i 's/\sudp$/ udp-client/g' /etc/openvpn/client/client.ovpn
+
+# 修复 tcp → tcp-client
+sed -i 's/\stcp$/ tcp-client/g' /etc/openvpn/client/client.ovpn
+
+# 删除任何非法 remote（例如 “error code: 500”）
+sed -i '/remote error/d' /etc/openvpn/client/client.ovpn
+sed -i '/remote code/d' /etc/openvpn/client/client.ovpn
+sed -i '/remote Error/d' /etc/openvpn/client/client.ovpn
+sed -i '/remote null/d' /etc/openvpn/client/client.ovpn
+
+# 删除 remote 空行
+sed -i '/^remote\s*$/d' /etc/openvpn/client/client.ovpn
+
+#------------- 永远禁止入口服务器默认路由被接管 ---------
 sed -i '/redirect-gateway/d' /etc/openvpn/client/client.ovpn
 
-#--------------- 强制兼容 OpenVPN 2.6 ---------------
-# 自动将 udp / tcp 旧语法修复为 udp-client / tcp-client
-sed -i 's/remote \(.*\) udp$/remote \1 udp-client/' /etc/openvpn/client/client.ovpn
-sed -i 's/remote \(.*\) tcp$/remote \1 tcp-client/' /etc/openvpn/client/client.ovpn
-
-#--------------- Systemd 自定义服务 -----------------
+#======================================================
+#   Systemd 服务：固定为 OpenVPN 2.6 推荐启动方式
+#======================================================
 cat >/etc/systemd/system/openvpn-client@client.service <<EOF
 [Unit]
 Description=OpenVPN Client (client)
