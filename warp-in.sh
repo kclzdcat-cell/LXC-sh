@@ -68,17 +68,31 @@ fi
 
 echo "✔ OpenVPN 已成功连接（检测到 tun0）"
 
-#======================================================
-# 入口服务器 IPv4 全部通过出口（WARP）走
-#======================================================
-TUN_GW="10.8.0.1"
-TABLE_ID=100
+echo ">>> 设置 IPv4 走 OpenVPN 出口..."
 
-ip rule del table $TABLE_ID 2>/dev/null || true
-ip route flush table $TABLE_ID 2>/dev/null || true
+# 获取 tun0 网关（动态获取，防止并非 10.8.0.1）
+TUN_GW=$(ip route | grep "tun0" | grep "proto kernel" | awk '{print $3}')
 
-ip route add default via $TUN_GW dev tun0 table $TABLE_ID
-ip rule add from all lookup $TABLE_ID priority 10000
+if [[ -z "$TUN_GW" ]]; then
+    TUN_GW="10.8.0.1"
+fi
+
+echo "检测到 OpenVPN 网关: $TUN_GW"
+
+# 清理旧规则
+ip rule del prio 10000 2>/dev/null || true
+ip route flush table 100 2>/dev/null || true
+
+# tun0 走出的路由表
+ip route add default via $TUN_GW dev tun0 table 100
+
+# 强制所有 IPv4 走 table 100
+ip rule add from 0.0.0.0/0 table 100 prio 10000
+
+# 添加 DNS（必须）
+echo "nameserver 1.1.1.1" >/etc/resolv.conf
+
+echo ">>> IPv4 路由修复完成！"
 
 echo "==========================================="
 echo " ✔ IPv4 已全部通过出口服务器（WARP）出站"
