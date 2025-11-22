@@ -26,7 +26,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/out
 bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/main/in.sh)
 ```
 
-## warp版
+## 🌏warp版
 # 出口部署
 
 ```bash
