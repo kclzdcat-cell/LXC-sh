@@ -48,41 +48,31 @@ download_with_retry() {
     done
 }
 
-# 主脚本开始
+# 主脚本
 log "开始安装 rfw 防火墙..."
 
 # ------------------------------------
-# 新增部分：检测老版本并清理
+# 检测旧版本并清理（最终稳定版本）
 # ------------------------------------
-if systemctl list-unit-files | grep -q "^rfw.service"; then
-    log "检测到旧版 rfw，开始清理..."
+if systemctl list-unit-files | grep -q "rfw.service"; then
+    log "检测到旧版本 rfw，开始清理..."
 
     # 停止服务
-    if systemctl is-active --quiet rfw; then
-        log "停止 rfw 服务..."
-        systemctl stop rfw
-    fi
+    systemctl stop rfw 2>/dev/null || true
 
     # 禁用服务
-    if systemctl is-enabled --quiet rfw; then
-        log "禁用 rfw 服务..."
-        systemctl disable rfw
-    fi
+    systemctl disable rfw 2>/dev/null || true
 
-    # 删除 service 文件
-    if [ -f /etc/systemd/system/rfw.service ]; then
-        log "删除旧的 systemd 服务文件..."
-        rm -f /etc/systemd/system/rfw.service
-    fi
+    # 删除旧 service 文件（多个位置）
+    rm -f /etc/systemd/system/rfw.service
+    rm -f /usr/lib/systemd/system/rfw.service
+    rm -f /lib/systemd/system/rfw.service
 
-    # 删除 rfw 主目录
-    if [ -d /root/rfw ]; then
-        log "删除旧的 rfw 目录..."
-        rm -rf /root/rfw
-    fi
+    # 删除程序目录
+    rm -rf /root/rfw
 
     systemctl daemon-reload
-    log "旧版本 rfw 已清理完毕"
+    log "旧版本 rfw 已清理完成"
 fi
 
 # ------------------------------------
@@ -97,47 +87,53 @@ case $ARCH in
         ARCH_SUFFIX="aarch64"
         ;;
     *)
-        log "❌ 不支持的架构: $ARCH (仅支持 x86_64 和 aarch64)"
+        log "❌ 不支持架构: $ARCH (仅支持 x86_64 / aarch64)"
         exit 1
         ;;
 esac
+
 log "检测到架构: $ARCH ($ARCH_SUFFIX)"
 
-# 检查 curl 是否安装
-if ! command -v curl &> /dev/null; then
+# ------------------------------------
+# 检查 curl
+# ------------------------------------
+if ! command -v curl &>/dev/null; then
     log "安装 curl..."
-    if command -v apt &> /dev/null; then
+    if command -v apt &>/dev/null; then
         apt update && apt install -y curl
-    elif command -v yum &> /dev/null; then
+    elif command -v yum &>/dev/null; then
         yum install -y curl
     else
-        log "错误: 无法自动安装 curl，请手动安装"
+        log "错误: 无法安装 curl，请手动安装。"
         exit 1
     fi
 fi
 
-# 不再询问，默认安装 rfw
-log "开始全新安装 rfw..."
+# ------------------------------------
+# 开始安装 rfw
+# ------------------------------------
+log "下载 rfw 程序..."
 
-# 创建 rfw 目录
 mkdir -p /root/rfw
 
-# 下载 rfw 主程序
-log "下载 rfw 主程序..."
-if ! download_with_retry "https://github.com/narwhal-cloud/rfw/releases/latest/download/rfw-$ARCH-unknown-linux-musl" "/root/rfw/rfw"; then
+if ! download_with_retry \
+    "https://github.com/narwhal-cloud/rfw/releases/latest/download/rfw-$ARCH-unknown-linux-musl" \
+    "/root/rfw/rfw"; then
     log "rfw 下载失败"
     exit 1
 fi
+
 chmod +x /root/rfw/rfw
 
+# ------------------------------------
 # 创建 systemd 服务
+# ------------------------------------
 log "创建 rfw 系统服务..."
 
-# 获取所有网络接口
 interfaces=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
 
 if [ ${#interfaces[@]} -eq 0 ]; then
-    echo "未找到可用的网络接口！"
+    echo "未找到网络接口！"
     exit 1
 fi
 
@@ -146,20 +142,19 @@ for i in "${!interfaces[@]}"; do
     echo "$((i+1)). ${interfaces[$i]}"
 done
 
-# 获取用户选择
 while true; do
-    read -p "请选择网卡编号 (1-${#interfaces[@]}): " choice
+    read -p "请选择网卡编号(1-${#interfaces[@]}): " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#interfaces[@]} ]; then
         selected_interface="${interfaces[$((choice-1))]}"
         break
     else
-        echo "无效的选择，请输入 1-${#interfaces[@]} 之间的数字"
+        echo "无效输入，请重新选择。"
     fi
 done
 
-echo "您选择的网卡是: $selected_interface"
+echo "使用网卡: $selected_interface"
 
-cat > /etc/systemd/system/rfw.service <<EOF
+cat >/etc/systemd/system/rfw.service <<EOF
 [Unit]
 Description=RFW Firewall Service
 After=network.target
@@ -178,9 +173,13 @@ EOF
 
 systemctl daemon-reload
 
+# ------------------------------------
 # 启动服务
+# ------------------------------------
 start_service rfw
 
-# 显示状态
-log "显示 rfw 服务状态："
+# ------------------------------------
+# 显示服务状态
+# ------------------------------------
+log "rfw 服务状态如下："
 systemctl status rfw
