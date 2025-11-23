@@ -51,7 +51,43 @@ download_with_retry() {
 # 主脚本开始
 log "开始安装 rfw 防火墙..."
 
+# ------------------------------------
+# 新增部分：检测老版本并清理
+# ------------------------------------
+if systemctl list-unit-files | grep -q "^rfw.service"; then
+    log "检测到旧版 rfw，开始清理..."
+
+    # 停止服务
+    if systemctl is-active --quiet rfw; then
+        log "停止 rfw 服务..."
+        systemctl stop rfw
+    fi
+
+    # 禁用服务
+    if systemctl is-enabled --quiet rfw; then
+        log "禁用 rfw 服务..."
+        systemctl disable rfw
+    fi
+
+    # 删除 service 文件
+    if [ -f /etc/systemd/system/rfw.service ]; then
+        log "删除旧的 systemd 服务文件..."
+        rm -f /etc/systemd/system/rfw.service
+    fi
+
+    # 删除 rfw 主目录
+    if [ -d /root/rfw ]; then
+        log "删除旧的 rfw 目录..."
+        rm -rf /root/rfw
+    fi
+
+    systemctl daemon-reload
+    log "旧版本 rfw 已清理完毕"
+fi
+
+# ------------------------------------
 # 检测架构
+# ------------------------------------
 ARCH=$(uname -m)
 case $ARCH in
     x86_64)
@@ -80,61 +116,50 @@ if ! command -v curl &> /dev/null; then
     fi
 fi
 
-# 询问是否安装 rfw 防火墙
-read -p "是否安装 rfw? [Y/n]: " install_rfw
-install_rfw=${install_rfw:-Y}
+# 不再询问，默认安装 rfw
+log "开始全新安装 rfw..."
 
-if [[ "$install_rfw" =~ ^[Yy]$ ]]; then
-    # 创建 rfw 目录和文件
-    log "设置 rfw..."
-    mkdir -p /root/rfw
+# 创建 rfw 目录
+mkdir -p /root/rfw
 
-    # 下载 rfw
-    if [ ! -f "/root/rfw/rfw" ]; then
-        if ! download_with_retry "https://github.com/narwhal-cloud/rfw/releases/latest/download/rfw-$ARCH-unknown-linux-musl" "/root/rfw/rfw"; then
-            log "rfw 下载失败"
-            exit 1
-        fi
-        chmod +x /root/rfw/rfw
+# 下载 rfw 主程序
+log "下载 rfw 主程序..."
+if ! download_with_retry "https://github.com/narwhal-cloud/rfw/releases/latest/download/rfw-$ARCH-unknown-linux-musl" "/root/rfw/rfw"; then
+    log "rfw 下载失败"
+    exit 1
+fi
+chmod +x /root/rfw/rfw
+
+# 创建 systemd 服务
+log "创建 rfw 系统服务..."
+
+# 获取所有网络接口
+interfaces=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
+
+if [ ${#interfaces[@]} -eq 0 ]; then
+    echo "未找到可用的网络接口！"
+    exit 1
+fi
+
+echo "可用的网络接口："
+for i in "${!interfaces[@]}"; do
+    echo "$((i+1)). ${interfaces[$i]}"
+done
+
+# 获取用户选择
+while true; do
+    read -p "请选择网卡编号 (1-${#interfaces[@]}): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#interfaces[@]} ]; then
+        selected_interface="${interfaces[$((choice-1))]}"
+        break
     else
-        log "rfw 已存在"
+        echo "无效的选择，请输入 1-${#interfaces[@]} 之间的数字"
     fi
+done
 
-    # 创建系统服务
-    if [ ! -f "/etc/systemd/system/rfw.service" ]; then
-        log "创建 rfw 系统服务..."
-        # 获取所有网络接口
-        interfaces=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
+echo "您选择的网卡是: $selected_interface"
 
-        # 检查是否有可用的网络接口
-        if [ ${#interfaces[@]} -eq 0 ]; then
-            echo "未找到可用的网络接口！"
-            exit 1
-        fi
-
-        # 显示可用的网络接口
-        echo "可用的网络接口："
-        for i in "${!interfaces[@]}"; do
-            echo "$((i+1)). ${interfaces[$i]}"
-        done
-
-        # 获取用户选择
-        while true; do
-            read -p "请选择网卡编号 (1-${#interfaces[@]}): " choice
-
-            # 验证输入
-            if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#interfaces[@]} ]; then
-                selected_interface="${interfaces[$((choice-1))]}"
-                break
-            else
-                echo "无效的选择，请输入 1-${#interfaces[@]} 之间的数字"
-            fi
-        done
-
-        echo "您选择的网卡是: $selected_interface"
-
-        # 创建 systemd 服务文件
-        cat > /etc/systemd/system/rfw.service <<EOF
+cat > /etc/systemd/system/rfw.service <<EOF
 [Unit]
 Description=RFW Firewall Service
 After=network.target
@@ -150,19 +175,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-    else
-        log "rfw 服务已存在"
-    fi
 
-    # 启动 rfw 服务
-    start_service rfw
-else
-    log "跳过 rfw 安装"
-fi
+systemctl daemon-reload
 
-# -------------------------
-# 新增：安装完成后输出服务状态
-# -------------------------
+# 启动服务
+start_service rfw
+
+# 显示状态
 log "显示 rfw 服务状态："
 systemctl status rfw
