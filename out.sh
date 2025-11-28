@@ -2,7 +2,7 @@
 set -e
 
 echo "==========================================="
-echo " OpenVPN 出口服务器自动部署脚本 V12（IPv4 + IPv6 双栈）"
+echo " OpenVPN 出口服务器自动部署脚本 V12.1（IPv4 + IPv6 双栈 + 指纹修复版）"
 echo "==========================================="
 
 #----------- 检测出口 IPv4 / IPv6 -----------
@@ -201,7 +201,17 @@ read -p "入口 SSH 用户(默认root)：" IN_USER
 IN_USER=${IN_USER:-root}
 read -p "入口 SSH 密码：" IN_PASS
 
-sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT $IN_USER@$IN_IP:/root/
+echo ">>> 正在清理旧的主机指纹..."
+mkdir -p /root/.ssh
+touch /root/.ssh/known_hosts
+# 尝试删除纯 IP 记录
+ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
+# 尝试删除 [IP]:Port 格式的记录 (非标准端口常见)
+ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
+
+echo ">>> 开始传输文件..."
+# 添加了 -o UserKnownHostsFile=/dev/null 作为双重保险，强制忽略指纹差异
+sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $CLIENT $IN_USER@$IN_IP:/root/
 
 echo "上传成功！出口服务器部署完成！"
 echo "==========================================="
