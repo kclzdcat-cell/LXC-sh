@@ -2,80 +2,284 @@
 set -e
 
 echo "==========================================="
-echo "      OpenVPN 入口服务器客户端部署 (IPv6 修复版)"
+echo " OpenVPN 出口部署脚本 V12.3（彻底修复IPv6 SSH断连）"
 echo "==========================================="
 
-# 1. 安装必要软件
-echo ">>> 更新系统并安装 OpenVPN..."
+#----------- 检测出口 IPv4 / IPv6 -----------
+PUB_IP4=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
+PUB_IP6=$(curl -s ipv6.ip.sb || echo "")
+
+echo "出口 IPv4: $PUB_IP4"
+echo "出口 IPv6: ${PUB_IP6:-未检测到 IPv6}"
+
+#----------- 检测网卡 -----------
+NIC=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+echo "出口网卡: $NIC"
+
+apt update -y
+apt install -y openvpn easy-rsa sshpass iptables-persistent curl
+
+#----------- 重建 PKI -----------
+rm -rf /etc/openvpn/easy-rsa
+mkdir -p /etc/openvpn/easy-rsa
+cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
+cd /etc/openvpn/easy-rsa
+
+export EASYRSA_BATCH=1
+
+echo ">>> 初始化 PKI ..."
+./easyrsa init-pki
+
+echo ">>> 生成 CA ..."
+./easyrsa build-ca nopass
+
+echo ">>> 生成服务器证书 ..."
+./easyrsa build-server-full server nopass
+
+echo ">>> 生成客户端证书 ..."
+./easyrsa build-client-full client nopass
+
+echo ">>> 生成 DH 参数 ..."
+./easyrsa gen-dh
+
+#----------- 拷贝证书 -----------
+cp pki/ca.crt /etc/openvpn/
+cp pki/dh.pem /etc/openvpn/
+cp pki/issued/server.crt /etc/openvpn/
+cp pki/private/server.key /etc/openvpn/
+cp pki/issued/client.crt /etc/openvpn/
+cp pki/private/client.key /etc/openvpn/
+
+#----------- 查找空闲端口 -----------
+find_free_port() {
+  p=$1
+  while ss -tuln | grep -q ":$p "; do
+    p=$((p+1))
+  done
+  echo $p
+}
+
+UDP_PORT=$(find_free_port 1194)
+TCP_PORT=$(find_free_port 443)
+
+echo "UDP端口 = $UDP_PORT"
+echo "TCP端口 = $TCP_PORT"
+
+#----------- 启用 IPv4 / IPv6 转发 -----------
+
+echo 1 >/proc/sys/net/ipv4/ip_forward
+sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+
+echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
+sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
+
+#----------- 配置 NAT (IPv4) -----------
+iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o $NIC -j MASQUERADE
+
+#----------- 配置 NAT (IPv6) 可用才启用 -----------
+HAS_IPV6=0
+if [[ -n "$PUB_IP6" ]]; then
+    if command -v ip6tables >/dev/null; then
+        HAS_IPV6=1
+        echo "检测到 IPv6，启用 IPv6 NAT..."
+        ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
+    fi
+fi
+
+iptables-save >/etc/iptables/rules.v4
+ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+
+#----------- server.conf（UDP）-----------
+# 修复点1：移除 redirect-gateway 中的 ipv6 选项，只接管 IPv4
+cat >/etc/openvpn/server.conf <<EOF
+port $UDP_PORT
+proto udp
+dev tun
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+
+server 10.8.0.0 255.255.255.0
+server-ipv6 fd00:1234::/64
+
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS6 2620:119:35::35"
+push "dhcp-option DNS6 2606:4700:4700::1111"
+
+keepalive 10 120
+cipher AES-256-GCM
+auth SHA256
+persist-key
+persist-tun
+verb 3
+EOF
+
+#----------- server-tcp.conf（TCP）-----------
+cat >/etc/openvpn/server-tcp.conf <<EOF
+port $TCP_PORT
+proto tcp
+dev tun
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+
+server 10.9.0.0 255.255.255.0
+server-ipv6 fd00:1234::/64
+
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS6 2620:119:35::35"
+push "dhcp-option DNS6 2606:4700:4700::1111"
+
+keepalive 10 120
+cipher AES-256-GCM
+auth SHA256
+persist-key
+persist-tun
+verb 3
+EOF
+
+#----------- 启动服务 -----------
+systemctl enable openvpn@server
+systemctl restart openvpn@server
+systemctl enable openvpn@server-tcp
+systemctl restart openvpn@server-tcp
+
+#----------- 生成 client.ovpn -----------
+CLIENT=/root/client.ovpn
+cat >$CLIENT <<EOF
+client
+dev tun
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-GCM
+auth SHA256
+auth-nocache
+resolv-retry infinite
+
+remote $PUB_IP4 $UDP_PORT udp
+remote $PUB_IP4 $TCP_PORT tcp
+EOF
+
+# 自动加入 IPv6 远程
+if [[ $HAS_IPV6 -eq 1 ]]; then
+cat >>$CLIENT <<EOF
+remote $PUB_IP6 $UDP_PORT udp
+remote $PUB_IP6 $TCP_PORT tcp
+EOF
+fi
+
+cat >>$CLIENT <<EOF
+
+<ca>
+$(cat /etc/openvpn/ca.crt)
+</ca>
+
+<cert>
+$(cat /etc/openvpn/client.crt)
+</cert>
+
+<key>
+$(cat /etc/openvpn/client.key)
+</key>
+EOF
+
+echo "client.ovpn 已生成：/root/client.ovpn"
+
+#----------- 生成 入口部署脚本 (in.sh) -----------
+IN_SCRIPT=/root/in.sh
+cat >$IN_SCRIPT <<'EOF'
+#!/bin/bash
+set -e
+echo "==========================================="
+echo "      OpenVPN 入口部署 (SSH 防断连版)"
+echo "==========================================="
+
+echo ">>> 安装组件..."
 apt update -y
 apt install -y openvpn iptables iptables-persistent
 
-# 2. 检查配置文件是否存在
 if [ ! -f /root/client.ovpn ]; then
-    echo "错误：未找到 /root/client.ovpn，请确认已上传配置文件！"
+    echo "错误：未找到 /root/client.ovpn"
     exit 1
 fi
 
-# 3. 部署配置文件
 echo ">>> 部署配置文件..."
 mkdir -p /etc/openvpn/client
 cp /root/client.ovpn /etc/openvpn/client/client.conf
 
-# 4. 修改 OpenVPN 配置以接管 IPv4 流量
-# 注意：这里追加 redirect-gateway def1 是核心，它会强制 IPv4 走 VPN
-# block-outside-dns 也是为了防止 DNS 泄露，但在纯 IPv6 环境下若报错可移除
-echo ">>> 配置路由接管规则..."
-cat >> /etc/openvpn/client/client.conf <<EOF
+echo ">>> 配置路由规则..."
+# 修复点2：强制忽略服务端可能推送的任何网关重定向指令
+# 修复点3：手动添加仅针对 IPv4 的重定向规则
+cat >> /etc/openvpn/client/client.conf <<CONF
 
-# --- 自动添加的路由规则 ---
-# 强制将默认 IPv4 网关重定向到 VPN (tun0)
-redirect-gateway def1
-
-# 保持 IPv6 路由不走 VPN (防止 SSH 断连)
-# 如果你的 VPN 服务端同时也推流了 IPv6 路由，建议加上下面这行忽略服务端推过来的 IPv6 路由：
+# --- 路由防断连保护 ---
+# 忽略服务端推送的 redirect-gateway，防止它意外接管 IPv6
+pull-filter ignore "redirect-gateway"
 pull-filter ignore "route-ipv6"
 pull-filter ignore "ifconfig-ipv6"
 
-# 强制使用公共 DNS (可选，防止原 DNS 不可达)
+# 仅在本地启用 IPv4 网关重定向 (不影响 IPv6)
+redirect-gateway def1
+
+# 强制 DNS
 dhcp-option DNS 8.8.8.8
 dhcp-option DNS 1.1.1.1
-EOF
+CONF
 
-# 5. 开启内核转发 (IPv4)
-echo ">>> 启用 IPv4 内核转发..."
+echo ">>> 开启 IPv4 转发..."
 if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-else
-    sed -i 's/^#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-    sed -i 's/^net.ipv4.ip_forward=0/net.ipv4.ip_forward=1/' /etc/sysctl.conf
 fi
-# 这里特别注意：我们只开启 IPv4 转发，不动 IPv6 的设置，避免断连
+# 确保不禁用 IPv6
+sed -i '/disable_ipv6/d' /etc/sysctl.conf
 sysctl -p
 
-# 6. 配置防火墙 NAT 规则
-# 确保从本机发出的流量或转发的流量可以通过 tun0 出去
-echo ">>> 配置 IPTables NAT 规则..."
+echo ">>> 配置 NAT..."
 iptables -t nat -F
 iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
 netfilter-persistent save
 
-# 7. 启动 OpenVPN 服务
-echo ">>> 启动 OpenVPN 客户端..."
+echo ">>> 启动 VPN..."
 systemctl enable openvpn-client@client
 systemctl restart openvpn-client@client
 
-# 8. 等待几秒让连接建立
-echo ">>> 等待 VPN 连接建立 (5秒)..."
+echo ">>> 等待连接..."
 sleep 5
+echo "==========================================="
+echo "验证结果："
+curl -4 --connect-timeout 5 ip.sb && echo "IPv4 接管成功" || echo "IPv4 获取失败"
+echo "IPv6 (SSH) 应保持畅通"
+EOF
+chmod +x $IN_SCRIPT
+echo "入口部署脚本已生成：/root/in.sh"
 
-# 9. 验证结果
+
+#----------- 上传到入口服务器 -----------
+echo "请输入入口服务器 SSH 信息："
+read -p "入口 IP：" IN_IP
+read -p "入口端口(默认22)：" IN_PORT
+IN_PORT=${IN_PORT:-22}
+read -p "入口 SSH 用户(默认root)：" IN_USER
+IN_USER=${IN_USER:-root}
+read -p "入口 SSH 密码：" IN_PASS
+
+echo ">>> 清理旧指纹..."
+mkdir -p /root/.ssh
+touch /root/.ssh/known_hosts
+ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
+ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
+
+echo ">>> 上传文件..."
+sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $CLIENT $IN_SCRIPT $IN_USER@$IN_IP:/root/
+
+echo "上传成功！"
+echo "请登录入口服务器，运行：bash /root/in.sh"
 echo "==========================================="
-echo "部署完成！正在验证网络状态..."
-echo "-------------------------------------------"
-echo "1. 本机 IPv4 出口 IP (应显示服务器 1 号 IP)："
-curl -4 --connect-timeout 5 ip.sb || echo "无法获取 IPv4 (VPN可能未连接)"
-echo "-------------------------------------------"
-echo "2. 隧道接口状态："
-ip addr show tun0 | grep "inet" || echo "tun0 未启动"
-echo "==========================================="
-echo "注意：SSH 连接应通过 IPv6 保持正常。"
