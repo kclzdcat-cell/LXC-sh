@@ -91,17 +91,25 @@ sleep 5
 echo "==========================================="
 echo "网络状态验证："
 echo "-------------------------------------------"
-echo "1. 接口状态："
-if ip addr show tun0 >/dev/null 2>&1; then
-    echo "   [OK] tun0 接口已启动 (IPv4 Only)"
+echo "1. OpenVPN 服务状态："
+if systemctl is-active --quiet openvpn-client@client; then
+    echo "   [OK] 服务运行中 (Active)"
 else
-    echo "   [ERROR] tun0 未启动！"
+    echo "   [ERROR] 服务未运行！"
+    echo "   >>> 错误日志 (最后5行)："
+    journalctl -u openvpn-client@client -n 5 --no-pager
 fi
 
 echo "-------------------------------------------"
 echo "2. IPv4 出口测试："
-IP4=$(curl -4 -s --connect-timeout 5 ip.sb || echo "Fail")
-echo "   当前 IPv4: $IP4 (应为出口服务器 IP)"
+IP4=$(curl -4 -s --connect-timeout 8 ip.sb || echo "获取失败")
+if [[ "$IP4" != "获取失败" ]]; then
+    # 使用绿色显示 IP
+    echo -e "   当前 IPv4: \033[32m$IP4\033[0m (应为出口服务器 IP)"
+else
+    # 使用红色显示失败
+    echo -e "   当前 IPv4: \033[31m获取失败\033[0m (请检查网络或 VPN 配置)"
+fi
 
 echo "-------------------------------------------"
 echo "3. IPv6 状态："
