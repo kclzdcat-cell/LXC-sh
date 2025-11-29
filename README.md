@@ -23,7 +23,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/out
 # 入口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/main/in.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/in.sh)
 ```
 
 ## 🌏warp版
