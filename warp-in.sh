@@ -2,7 +2,7 @@
 set -e
 
 echo "========================================================"
-echo "   OpenVPN 入口端自动配置脚本 v3.5 (修复安装顺序)"
+echo "   OpenVPN 入口端自动配置脚本 v3.6"
 echo "   ✔ 自动判断本机是否有 IPv4"
 echo "   ✔ 有 IPv4 则顶替，无 IPv4 则新增"
 echo "   ✔ 严格保持 IPv6 路由不变 (保障 SSH)"
@@ -68,32 +68,80 @@ else
     exit 1
 fi
 
-# 4. 创建必要的目录
+# 4. 清理旧服务残留
+echo ">>> 清理旧服务残留..."
+# 停止可能存在的旧服务
+systemctl stop openvpn-client@client 2>/dev/null || true
+systemctl disable openvpn-client@client 2>/dev/null || true
+# 清理可能存在的旧进程
+killall openvpn 2>/dev/null || true
+sleep 2
+echo "✔ 清理完成"
+
+# 5. 创建必要的目录
 echo ">>> 确保目录结构正确..."
 mkdir -p /etc/openvpn/client
 echo "✔ 目录检查完成"
 
-# 5. 启动服务
-echo ">>> 重启 OpenVPN 服务..."
+# 6. 启动服务
+echo ">>> 启动 OpenVPN 服务..."
 systemctl daemon-reload
-systemctl enable openvpn-client@client --now
-systemctl restart openvpn-client@client
+echo "   - daemon-reload 完成"
 
-# 6. 检查服务状态
+# 先 enable
+if systemctl enable openvpn-client@client 2>&1; then
+    echo "   - 服务已设置为开机启动"
+else
+    echo "   ⚠️  enable 失败，但继续尝试启动..."
+fi
+
+# 再 start
+echo "   - 正在启动服务..."
+if systemctl start openvpn-client@client 2>&1; then
+    echo "   - 服务启动命令执行完成"
+else
+    echo "   ❌ 服务启动命令执行失败"
+fi
+
+# 7. 检查服务状态
 echo ">>> 检查 OpenVPN 服务状态..."
-sleep 2
-if ! systemctl is-active --quiet openvpn-client@client; then
-    echo "❌ OpenVPN 服务启动失败！"
-    echo ">>> 服务状态:"
-    systemctl status openvpn-client@client --no-pager -l
+sleep 3
+
+# 获取服务状态
+SERVICE_STATUS=$(systemctl is-active openvpn-client@client 2>&1 || echo "inactive")
+echo "   服务状态: $SERVICE_STATUS"
+
+if [ "$SERVICE_STATUS" != "active" ]; then
     echo ""
-    echo ">>> 最近日志:"
-    journalctl -u openvpn-client@client -n 30 --no-pager
+    echo "❌ OpenVPN 服务启动失败！"
+    echo "========================================"
+    echo ">>> 详细服务状态:"
+    echo "========================================"
+    systemctl status openvpn-client@client --no-pager -l || true
+    echo ""
+    echo "========================================"
+    echo ">>> 最近50行日志:"
+    echo "========================================"
+    journalctl -u openvpn-client@client -n 50 --no-pager || true
+    echo ""
+    echo "========================================"
+    echo ">>> 配置文件检查:"
+    echo "========================================"
+    if [ -f "$TARGET_FILE" ]; then
+        echo "配置文件存在: $TARGET_FILE"
+        echo "文件大小: $(wc -c < "$TARGET_FILE") bytes"
+        echo "前10行内容:"
+        head -n 10 "$TARGET_FILE"
+    else
+        echo "❌ 配置文件不存在: $TARGET_FILE"
+    fi
+    echo ""
+    echo ">>> 请检查以上错误信息。"
     exit 1
 fi
 echo "✔ OpenVPN 服务运行中"
 
-# 7. 等待连接建立
+# 8. 等待连接建立
 echo ">>> 正在等待连接建立 (tun0)..."
 TIMEOUT=0
 MAX_WAIT=30  # 增加到30秒
@@ -137,7 +185,7 @@ if [ $TIMEOUT -ge $MAX_WAIT ]; then
     exit 1
 fi
 
-# 8. [智能路由配置] - 这里的逻辑完全符合你的要求
+# 9. [智能路由配置] - 这里的逻辑完全符合你的要求
 echo ">>> 配置 IPv4 路由..."
 
 # 判断是否存在原生 IPv4 默认路由
@@ -160,7 +208,7 @@ fi
 echo "✔ IPv4 路由规则已应用"
 echo "✔ IPv6 路由保持不变 (由 route-nopull 保证)"
 
-# 9. 最终测试
+# 10. 最终测试
 echo "========================================================"
 echo "   🚀 最终连通性测试"
 echo "========================================================"
