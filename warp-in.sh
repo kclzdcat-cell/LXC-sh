@@ -2,7 +2,7 @@
 set -e
 
 echo "========================================================"
-echo "   OpenVPN 入口端自动配置脚本 v3.4 (智能路由版)"
+echo "   OpenVPN 入口端自动配置脚本 v3.5 (修复安装顺序)"
 echo "   ✔ 自动判断本机是否有 IPv4"
 echo "   ✔ 有 IPv4 则顶替，无 IPv4 则新增"
 echo "   ✔ 严格保持 IPv6 路由不变 (保障 SSH)"
@@ -13,7 +13,19 @@ SOURCE_FILE="/root/client.ovpn"
 TARGET_FILE="/etc/openvpn/client/client.conf"
 # ===========================================
 
-# 1. 检查并修复 TUN 设备
+# 1. 优先安装 OpenVPN
+echo ">>> 检查并安装 OpenVPN..."
+if ! command -v openvpn &> /dev/null; then
+    echo ">>> OpenVPN 未安装，正在安装..."
+    apt-get update -qq
+    apt-get install -y openvpn
+    echo "✔ OpenVPN 安装完成"
+else
+    OPENVPN_VERSION=$(openvpn --version | head -n 1)
+    echo "✔ OpenVPN 已安装: $OPENVPN_VERSION"
+fi
+
+# 2. 检查并修复 TUN 设备
 if [ ! -c /dev/net/tun ]; then
     echo ">>> 检测到 TUN 设备缺失，尝试修复..."
     mkdir -p /dev/net
@@ -26,7 +38,7 @@ if [ ! -c /dev/net/tun ]; then
     echo "✔ TUN 设备修复成功"
 fi
 
-# 2. 处理配置文件
+# 3. 处理配置文件
 echo ">>> 检查配置文件..."
 if [ -f "$SOURCE_FILE" ]; then
     echo "✔ 发现上传的配置文件：$SOURCE_FILE"
@@ -56,19 +68,18 @@ else
     exit 1
 fi
 
-# 3. 安装 OpenVPN
-if ! command -v openvpn &> /dev/null; then
-    echo ">>> 安装 OpenVPN..."
-    apt-get update && apt-get install -y openvpn
-fi
+# 4. 创建必要的目录
+echo ">>> 确保目录结构正确..."
+mkdir -p /etc/openvpn/client
+echo "✔ 目录检查完成"
 
-# 4. 启动服务
+# 5. 启动服务
 echo ">>> 重启 OpenVPN 服务..."
 systemctl daemon-reload
 systemctl enable openvpn-client@client --now
 systemctl restart openvpn-client@client
 
-# 5. 检查服务状态
+# 6. 检查服务状态
 echo ">>> 检查 OpenVPN 服务状态..."
 sleep 2
 if ! systemctl is-active --quiet openvpn-client@client; then
@@ -82,7 +93,7 @@ if ! systemctl is-active --quiet openvpn-client@client; then
 fi
 echo "✔ OpenVPN 服务运行中"
 
-# 6. 等待连接建立
+# 7. 等待连接建立
 echo ">>> 正在等待连接建立 (tun0)..."
 TIMEOUT=0
 MAX_WAIT=30  # 增加到30秒
@@ -126,7 +137,7 @@ if [ $TIMEOUT -ge $MAX_WAIT ]; then
     exit 1
 fi
 
-# 7. [智能路由配置] - 这里的逻辑完全符合你的要求
+# 8. [智能路由配置] - 这里的逻辑完全符合你的要求
 echo ">>> 配置 IPv4 路由..."
 
 # 判断是否存在原生 IPv4 默认路由
@@ -149,7 +160,7 @@ fi
 echo "✔ IPv4 路由规则已应用"
 echo "✔ IPv6 路由保持不变 (由 route-nopull 保证)"
 
-# 8. 最终测试
+# 9. 最终测试
 echo "========================================================"
 echo "   🚀 最终连通性测试"
 echo "========================================================"
