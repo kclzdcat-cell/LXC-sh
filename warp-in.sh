@@ -2,7 +2,7 @@
 set -e
 
 echo "========================================================"
-echo "   OpenVPN 入口端自动配置脚本 v3.3 (完美配对版)"
+echo "   OpenVPN 入口端自动配置脚本 v3.31 (完美配对版)"
 echo "   ✔ 自动接管 /root/client.ovpn"
 echo "   ✔ 强制修正协议为 udp6 (适配纯 IPv6)"
 echo "   ✔ 自动修复 LXC TUN 设备"
