@@ -178,33 +178,87 @@ EOF
 echo "client.ovpn 已生成：/root/client.ovpn"
 
 #======================================================
-#   自动上传（保持你的原逻辑）
+#   自动上传（增强版：带验证和错误显示）
 #======================================================
 echo "=============== 上传 client.ovpn 到入口服务器 ==============="
 
-read -p "入口服务器 IP（IPv4/IPv6）： " IN_IP
+# 1. 获取输入信息
+read -p "入口服务器 IP（IPV4/IPV6，IPV6无需加[]）： " IN_IP
 read -p "入口 SSH 端口（默认22）： " IN_PORT
 IN_PORT=${IN_PORT:-22}
 read -p "SSH 用户（默认 root）： " IN_USER
 IN_USER=${IN_USER:-root}
 read -p "SSH 密码： " IN_PASS
 
+# 清理旧的 host key 防止指纹报错
 ssh-keygen -R "$IN_IP" >/dev/null 2>&1 || true
+# 针对 IPv6 去掉可能用户手动输入的方括号，脚本后面会自动加
+CLEAN_IP=$(echo "$IN_IP" | tr -d '[]')
+
+# 2. 定义上传和验证函数
+upload_and_verify() {
+    local TYPE=$1
+    local TARGET_IP=$2
+    local TARGET_FILE="/root/client.ovpn"
+    
+    echo "------------------------------------------------"
+    echo ">>> 正在尝试通过 $TYPE 传输..."
+    
+    # 尝试上传 (去掉 2>/dev/null 以便看到报错)
+    sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+        "$CLIENT" "${IN_USER}@${TARGET_IP}:${TARGET_FILE}"
+        
+    if [ $? -eq 0 ]; then
+        echo ">>> SCP 命令执行完毕，正在进行远程验证..."
+        
+        # 远程验证文件是否存在
+        sshpass -p "$IN_PASS" ssh -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            "${IN_USER}@${TARGET_IP}" "ls -lh $TARGET_FILE"
+            
+        if [ $? -eq 0 ]; then
+            echo "✅ 验证成功！文件已存在于入口服务器：$TARGET_FILE"
+            return 0
+        else
+            echo "❌ 验证失败：SCP 似乎成功了，但远程没找到文件 (可能路径无权限)"
+            return 1
+        fi
+    else
+        echo "❌ SCP 上传命令失败 (请检查上方报错信息)"
+        return 1
+    fi
+}
+
+# 3. 执行上传循环
+UPLOAD_SUCCESS=0
 
 for i in 1 2 3; do
-    echo "第 $i 次尝试上传..."
-    if sshpass -p "$IN_PASS" scp -6 -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT ${IN_USER}@[$IN_IP]:/root/ 2>/dev/null; then
-        echo "✔ IPv6 上传成功！"
+    echo "=== 第 $i 次尝试上传 ==="
+    
+    # 优先尝试 IPv6 (加上方括号)
+    if upload_and_verify "IPv6" "[${CLEAN_IP}]"; then
+        UPLOAD_SUCCESS=1
         break
     fi
-    if sshpass -p "$IN_PASS" scp -4 -P $IN_PORT -o StrictHostKeyChecking=no $CLIENT ${IN_USER}@$IN_IP:/root/ 2>/dev/null; then
-        echo "✔ IPv4 上传成功！"
-        break
+    
+    # 备选：尝试 IPv4 (不加方括号，万一你输的是v4地址)
+    if [[ "$CLEAN_IP" != *":"* ]]; then
+        if upload_and_verify "IPv4" "${CLEAN_IP}"; then
+            UPLOAD_SUCCESS=1
+            break
+        fi
     fi
-    sleep 1
+    
+    echo ">>> 等待 2 秒后重试..."
+    sleep 2
 done
 
 echo "======================================================="
-echo "🚀 OpenVPN 出口节点部署完成！"
-echo " client.ovpn 已上传（如果显示成功）"
+if [ $UPLOAD_SUCCESS -eq 1 ]; then
+    echo "🚀 OpenVPN 出口节点部署完成！"
+    echo "✅ client.ovpn 已成功传输并验证。"
+    echo "👉 下一步：请登录入口服务器，运行 warp-in.sh"
+else
+    echo "❌ 自动上传失败。"
+    echo "   请手动下载 /root/client.ovpn 并上传到入口服务器的 /root/ 目录"
+fi
 echo "======================================================="
