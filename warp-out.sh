@@ -2,14 +2,14 @@
 set -e
 
 echo "==========================================="
-echo " OpenVPN 出口服务器自动部署脚本（最终稳定版 v3.0）"
-echo " 保留全部功能：UDP+TCP、IPv6、上传等"
-echo " 修复 NAT 错误 + 完整路由推送 + DNS 推送"
-echo " 自动检测网卡，无需手动修改"
+echo " OpenVPN 出口服务器自动部署脚本（v3.2 修复版）"
+echo " ✔ 协议强制 IPv6 (udp6/tcp6)"
+echo " ✔ 修复 SSH 验证端口参数错误"
+echo " ✔ 包含 NAT 修复与自动上传验证"
 echo "==========================================="
 
 #======================================================
-#   自动检测公网 IPv6（绝不失败）
+#   1. 自动检测公网 IPv6
 #======================================================
 PUB_IP6=$(ip -6 addr show | grep global | grep -v temporary | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
 
@@ -21,7 +21,7 @@ fi
 echo "检测到出口公网 IPv6: $PUB_IP6"
 
 #======================================================
-#   自动检测出口网卡（自动识别默认路由）
+#   2. 自动检测出口网卡
 #======================================================
 NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
 NIC=${NIC:-eth0}
@@ -32,7 +32,7 @@ apt update -y
 apt install -y openvpn easy-rsa sshpass iptables-persistent
 
 #======================================================
-#   初始化 PKI
+#   3. 初始化 PKI (证书生成)
 #======================================================
 rm -rf /etc/openvpn/easy-rsa
 mkdir -p /etc/openvpn/easy-rsa
@@ -56,7 +56,7 @@ cp pki/private/client.key /etc/openvpn/
 cp ta.key /etc/openvpn/
 
 #======================================================
-#   端口保持你原来的设置
+#   4. 端口配置
 #======================================================
 UDP_PORT=1196
 TCP_PORT=443
@@ -65,29 +65,29 @@ echo "使用 UDP 端口: $UDP_PORT"
 echo "使用 TCP 端口: $TCP_PORT"
 
 #======================================================
-#   修复 NAT（关键修复点）
+#   5. 修复 NAT 转发
 #======================================================
 echo 1 >/proc/sys/net/ipv4/ip_forward
 echo 1 >/proc/sys/net/ipv6/conf/all/forwarding
 
-# UDP 网段 10.8.0.0/24
+# UDP 网段 10.8.0.0/24 -> 出口网卡
 iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $NIC -j MASQUERADE
 
-# TCP 网段 10.9.0.0/24
+# TCP 网段 10.9.0.0/24 -> 出口网卡
 iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o $NIC -j MASQUERADE
 
-# IPv6 NAT（保持原样）
+# IPv6 NAT
 ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE
 
 iptables-save >/etc/iptables/rules.v4
 ip6tables-save >/etc/iptables/rules.v6
 
 #======================================================
-#   server.conf（保持原样，仅 NAT 修复）
+#   6. 生成服务端配置 server.conf (强制 udp6)
 #======================================================
 cat >/etc/openvpn/server.conf <<EOF
 port $UDP_PORT
-proto udp
+proto udp6
 dev tun
 topology subnet
 ca ca.crt
@@ -109,11 +109,11 @@ verb 3
 EOF
 
 #======================================================
-#   server-tcp.conf（保持原样，仅 NAT 修复）
+#   7. 生成服务端配置 server-tcp.conf (强制 tcp6)
 #======================================================
 cat >/etc/openvpn/server-tcp.conf <<EOF
 port $TCP_PORT
-proto tcp
+proto tcp6
 dev tun
 topology subnet
 ca ca.crt
@@ -133,13 +133,14 @@ persist-tun
 verb 3
 EOF
 
+# 重启服务
 systemctl enable openvpn@server
 systemctl restart openvpn@server
 systemctl enable openvpn@server-tcp
 systemctl restart openvpn@server-tcp
 
 #======================================================
-#   生成 client.ovpn（保持原设计）
+#   8. 生成客户端配置 client.ovpn (强制 IPv6)
 #======================================================
 CLIENT=/root/client.ovpn
 
@@ -155,8 +156,8 @@ auth SHA256
 auth-nocache
 resolv-retry infinite
 
-remote $PUB_IP6 $UDP_PORT udp
-remote $PUB_IP6 $TCP_PORT tcp
+remote $PUB_IP6 $UDP_PORT udp6
+remote $PUB_IP6 $TCP_PORT tcp6
 
 <ca>
 $(cat /etc/openvpn/ca.crt)
@@ -178,24 +179,23 @@ EOF
 echo "client.ovpn 已生成：/root/client.ovpn"
 
 #======================================================
-#   自动上传（增强版：带验证和错误显示）
+#   9. 自动上传到入口服务器 (修复 SSH 验证端口参数)
 #======================================================
 echo "=============== 上传 client.ovpn 到入口服务器 ==============="
 
-# 1. 获取输入信息
-read -p "入口服务器 IP（IPV4/IPV6，IPV6无需加[]）： " IN_IP
+read -p "入口服务器 IP（IPv6，无需加[]）： " IN_IP
 read -p "入口 SSH 端口（默认22）： " IN_PORT
 IN_PORT=${IN_PORT:-22}
 read -p "SSH 用户（默认 root）： " IN_USER
 IN_USER=${IN_USER:-root}
 read -p "SSH 密码： " IN_PASS
 
-# 清理旧的 host key 防止指纹报错
+# 清理旧的 host key
 ssh-keygen -R "$IN_IP" >/dev/null 2>&1 || true
-# 针对 IPv6 去掉可能用户手动输入的方括号，脚本后面会自动加
+# 去掉可能存在的方括号
 CLEAN_IP=$(echo "$IN_IP" | tr -d '[]')
 
-# 2. 定义上传和验证函数
+# 定义上传验证函数
 upload_and_verify() {
     local TYPE=$1
     local TARGET_IP=$2
@@ -204,43 +204,43 @@ upload_and_verify() {
     echo "------------------------------------------------"
     echo ">>> 正在尝试通过 $TYPE 传输..."
     
-    # 尝试上传 (去掉 2>/dev/null 以便看到报错)
-    sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+    # SCP 上传 (-P 大写)
+    sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
         "$CLIENT" "${IN_USER}@${TARGET_IP}:${TARGET_FILE}"
         
     if [ $? -eq 0 ]; then
-        echo ">>> SCP 命令执行完毕，正在进行远程验证..."
+        echo ">>> SCP 命令执行成功，正在验证文件..."
         
-        # 远程验证文件是否存在
-        sshpass -p "$IN_PASS" ssh -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+        # 远程验证 (已修复：使用 -p 小写)
+        sshpass -p "$IN_PASS" ssh -p $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "${IN_USER}@${TARGET_IP}" "ls -lh $TARGET_FILE"
             
         if [ $? -eq 0 ]; then
-            echo "✅ 验证成功！文件已存在于入口服务器：$TARGET_FILE"
+            echo "✅ 验证成功！文件已存在于入口服务器。"
             return 0
         else
-            echo "❌ 验证失败：SCP 似乎成功了，但远程没找到文件 (可能路径无权限)"
+            echo "❌ 验证失败：文件可能未正确写入，或无法执行 ls 命令。"
             return 1
         fi
     else
-        echo "❌ SCP 上传命令失败 (请检查上方报错信息)"
+        echo "❌ SCP 上传失败，可能是网络不通或密码错误。"
         return 1
     fi
 }
 
-# 3. 执行上传循环
+# 执行循环
 UPLOAD_SUCCESS=0
 
 for i in 1 2 3; do
     echo "=== 第 $i 次尝试上传 ==="
     
-    # 优先尝试 IPv6 (加上方括号)
+    # 优先尝试 IPv6 (加方括号)
     if upload_and_verify "IPv6" "[${CLEAN_IP}]"; then
         UPLOAD_SUCCESS=1
         break
     fi
     
-    # 备选：尝试 IPv4 (不加方括号，万一你输的是v4地址)
+    # 备选：尝试 IPv4 (不加方括号)
     if [[ "$CLEAN_IP" != *":"* ]]; then
         if upload_and_verify "IPv4" "${CLEAN_IP}"; then
             UPLOAD_SUCCESS=1
