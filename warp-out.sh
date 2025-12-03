@@ -179,86 +179,76 @@ EOF
 echo "client.ovpn 已生成：/root/client.ovpn"
 
 #======================================================
-#   9. 自动上传到入口服务器 (修复 SSH 验证端口参数)
+#   9. 自动上传与验证 (最终修复逻辑)
 #======================================================
 echo "=============== 上传 client.ovpn 到入口服务器 ==============="
 
-read -p "入口服务器 IP（IPv6，无需加[]）： " IN_IP
+read -p "入口服务器 IP（IPv6/IPv4，无需加[]）： " IN_IP
 read -p "入口 SSH 端口（默认22）： " IN_PORT
 IN_PORT=${IN_PORT:-22}
 read -p "SSH 用户（默认 root）： " IN_USER
 IN_USER=${IN_USER:-root}
 read -p "SSH 密码： " IN_PASS
 
-# 清理旧的 host key
-ssh-keygen -R "$IN_IP" >/dev/null 2>&1 || true
-# 去掉可能存在的方括号
+# 清理可能存在的方括号，只保留纯 IP
 CLEAN_IP=$(echo "$IN_IP" | tr -d '[]')
+# 清理旧主机的 Key 防止指纹报错
+ssh-keygen -R "$CLEAN_IP" >/dev/null 2>&1 || true
 
-# 定义上传验证函数
+# --- 核心修复：分离 SCP 和 SSH 的地址格式 ---
 upload_and_verify() {
-    local TYPE=$1
-    local TARGET_IP=$2
+    local RAW_IP=$1      # 纯净 IP (给 ssh 用)
+    local SCP_HOST=""    # 格式化 IP (给 scp 用)
+    
+    # 判断是否为 IPv6 (包含冒号)
+    if [[ "$RAW_IP" == *":"* ]]; then
+        SCP_HOST="[${RAW_IP}]"  # IPv6: scp 需要 [IP]
+    else
+        SCP_HOST="${RAW_IP}"    # IPv4: scp 直接用 IP
+    fi
+
     local TARGET_FILE="/root/client.ovpn"
     
     echo "------------------------------------------------"
-    echo ">>> 正在尝试通过 $TYPE 传输..."
+    echo ">>> 正在尝试传输..."
+    echo "    SSH 目标 (验证用): ${RAW_IP}"
+    echo "    SCP 目标 (传输用): ${SCP_HOST}"
     
-    # SCP 上传 (-P 大写)
+    # 1. SCP 上传 (注意: -P 大写)
     sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-        "$CLIENT" "${IN_USER}@${TARGET_IP}:${TARGET_FILE}"
+        "$CLIENT" "${IN_USER}@${SCP_HOST}:${TARGET_FILE}"
         
     if [ $? -eq 0 ]; then
-        echo ">>> SCP 命令执行成功，正在验证文件..."
+        echo ">>> SCP 上传看似成功，正在进行最终验证..."
         
-        # 远程验证 (已修复：使用 -p 小写)
+        # 2. SSH 远程验证 (注意: -p 小写，且使用 RAW_IP 不带括号)
         sshpass -p "$IN_PASS" ssh -p $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            "${IN_USER}@${TARGET_IP}" "ls -lh $TARGET_FILE"
+            "${IN_USER}@${RAW_IP}" "ls -lh $TARGET_FILE"
             
         if [ $? -eq 0 ]; then
-            echo "✅ 验证成功！文件已存在于入口服务器。"
+            echo "✅ 验证成功！文件确认存在于入口服务器。"
             return 0
         else
-            echo "❌ 验证失败：文件可能未正确写入，或无法执行 ls 命令。"
+            echo "❌ 验证失败：虽然 SCP 没报错，但远程找不到文件 (可能是权限或路径问题)。"
             return 1
         fi
     else
-        echo "❌ SCP 上传失败，可能是网络不通或密码错误。"
+        echo "❌ SCP 上传失败 (返回码 $?)。"
         return 1
     fi
 }
 
-# 执行循环
-UPLOAD_SUCCESS=0
-
-for i in 1 2 3; do
-    echo "=== 第 $i 次尝试上传 ==="
-    
-    # 优先尝试 IPv6 (加方括号)
-    if upload_and_verify "IPv6" "[${CLEAN_IP}]"; then
-        UPLOAD_SUCCESS=1
-        break
-    fi
-    
-    # 备选：尝试 IPv4 (不加方括号)
-    if [[ "$CLEAN_IP" != *":"* ]]; then
-        if upload_and_verify "IPv4" "${CLEAN_IP}"; then
-            UPLOAD_SUCCESS=1
-            break
-        fi
-    fi
-    
-    echo ">>> 等待 2 秒后重试..."
-    sleep 2
-done
-
-echo "======================================================="
-if [ $UPLOAD_SUCCESS -eq 1 ]; then
+# --- 执行 ---
+# 直接传入清理后的 IP，由函数内部自动判断格式
+if upload_and_verify "$CLEAN_IP"; then
+    echo "======================================================="
     echo "🚀 OpenVPN 出口节点部署完成！"
     echo "✅ client.ovpn 已成功传输并验证。"
     echo "👉 下一步：请登录入口服务器，运行 warp-in.sh"
+    echo "======================================================="
 else
-    echo "❌ 自动上传失败。"
+    echo "======================================================="
+    echo "❌ 自动上传最终失败。"
     echo "   请手动下载 /root/client.ovpn 并上传到入口服务器的 /root/ 目录"
+    echo "======================================================="
 fi
-echo "======================================================="
