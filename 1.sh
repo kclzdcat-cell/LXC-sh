@@ -1,111 +1,101 @@
 #!/bin/bash
 
-echo "=============================================="
-echo " LXC 机场 面板 / 节点 精准审计（v3 FINAL）"
-echo " 仅识别【真实运行中的机场服务】"
-echo "=============================================="
+THRESHOLD_PANEL=6
+THRESHOLD_NODE=6
+
+echo "=================================================="
+echo " LXC 机场服务审计工具（FINAL 可用版）"
+echo " 基于多证据评分制，避免误杀自建服务"
+echo "=================================================="
 echo
 
-PANEL_ACTIVE=()
-NODE_ACTIVE=()
-NODE_INACTIVE=()
+declare -A PANEL_SCORE
+declare -A NODE_SCORE
 
 for c in $(lxc list -c n --format csv); do
   echo "🔍 正在审计容器：$c"
+  PANEL_SCORE[$c]=0
+  NODE_SCORE[$c]=0
 
-  # ===============================
-  # 1. 机场面板（v2board / xboard）
-  # ===============================
+  # ------------------------------------------------
+  # 一、机场面板行为检测
+  # ------------------------------------------------
+
+  # Web 服务运行
+  if lxc exec "$c" -- ps aux | grep -E "nginx|apache|caddy|traefik" | grep -v grep >/dev/null 2>&1; then
+    PANEL_SCORE[$c]=$((PANEL_SCORE[$c]+2))
+  fi
+
+  # 后端语言（php / node / python）
+  if lxc exec "$c" -- ps aux | grep -E "php-fpm|node .*server|gunicorn|uwsgi" | grep -v grep >/dev/null 2>&1; then
+    PANEL_SCORE[$c]=$((PANEL_SCORE[$c]+2))
+  fi
+
+  # Laravel / 常见面板结构
+  if lxc exec "$c" -- sh -c 'find / -maxdepth 3 -name artisan 2>/dev/null | grep -q .' ; then
+    PANEL_SCORE[$c]=$((PANEL_SCORE[$c]+2))
+  fi
+
+  if lxc exec "$c" -- sh -c 'find / -maxdepth 3 -name ".env" 2>/dev/null | grep -q .' ; then
+    PANEL_SCORE[$c]=$((PANEL_SCORE[$c]+1))
+  fi
+
+  # API 行为特征
+  if lxc exec "$c" -- sh -c 'ss -tnp | grep -E ":80|:443" | grep -E "php|node|python" >/dev/null 2>&1' ; then
+    PANEL_SCORE[$c]=$((PANEL_SCORE[$c]+1))
+  fi
+
+  # ------------------------------------------------
+  # 二、机场节点行为检测
+  # ------------------------------------------------
+
+  # 控制程序（V2bX / XrayR / sspanel-node 等）
+  if lxc exec "$c" -- ps aux | grep -E "[V]2bX|[X]rayR|sspanel-node" >/dev/null 2>&1; then
+    NODE_SCORE[$c]=$((NODE_SCORE[$c]+3))
+  fi
+
+  # 明确的面板对接配置（强证据）
   if lxc exec "$c" -- sh -c '
-    # 必须是运行态
-    ps aux | grep -E "php-fpm|nginx|apache" | grep -v grep >/dev/null 2>&1 || exit 1
-
-    # 必须是 Laravel 结构
-    find / -maxdepth 3 -type f -name ".env" 2>/dev/null | grep -q . || exit 1
-    find / -maxdepth 3 -type f -name "artisan" 2>/dev/null | grep -q . || exit 1
-
-    exit 0
-  ' >/dev/null 2>&1; then
-    echo "🚨 命中：运行中的【机场面板】"
-    PANEL_ACTIVE+=("$c")
-    echo
-    continue
+    grep -R "panel_url\|node_id\|api_key\|token" /etc /opt 2>/dev/null | grep -q .
+  ' ; then
+    NODE_SCORE[$c]=$((NODE_SCORE[$c]+3))
   fi
 
-  # ===============================
-  # 2. 机场节点（V2bX，运行态）
-  # ===============================
-  if lxc exec "$c" -- sh -c '
-    # 必须有 V2bX 主进程
-    ps aux | grep "[V]2bX" >/dev/null 2>&1 || exit 1
-
-    # 必须有真实面板对接配置
-    [ -f /etc/V2bX/config.json ] || exit 1
-    grep -Eq "\"panel_url\".*https?://" /etc/V2bX/config.json || exit 1
-    grep -Eq "\"node_id\"[[:space:]]*:[[:space:]]*[0-9]+" /etc/V2bX/config.json || exit 1
-
-    # 必须至少一个运行期证据
-    (
-      ps -eo pid,ppid,cmd | grep "[V]2bX" | grep -E "sing-box|xray" ||
-      ls /etc/V2bX/user/* >/dev/null 2>&1 ||
-      ss -tnp | grep V2bX
-    ) || exit 1
-
-    exit 0
-  ' >/dev/null 2>&1; then
-    echo "⚠️ 命中：运行中的【机场节点（V2bX）】"
-    NODE_ACTIVE+=("$c")
-    echo
-    continue
+  # 用户 / 流量缓存
+  if lxc exec "$c" -- sh -c 'ls /etc | grep -E "V2bX|xrayr|sspanel" >/dev/null 2>&1' ; then
+    NODE_SCORE[$c]=$((NODE_SCORE[$c]+2))
   fi
 
-  # ===============================
-  # 3. 装过但未运行（不报警）
-  # ===============================
-  if lxc exec "$c" -- test -d /etc/V2bX >/dev/null 2>&1; then
-    echo "ℹ️ 发现 V2bX 文件，但未运行（不判定为机场）"
-    NODE_INACTIVE+=("$c")
-    echo
-    continue
+  # 长连接通信（节点与面板）
+  if lxc exec "$c" -- ss -tnp | grep -E "ESTAB" | grep -E "xray|sing-box|V2bX" >/dev/null 2>&1; then
+    NODE_SCORE[$c]=$((NODE_SCORE[$c]+1))
   fi
 
-  echo "✅ 未发现机场相关服务"
+  # ------------------------------------------------
+  # 三、明显自建特征（降权）
+  # ------------------------------------------------
+
+  # 只有代理，没有控制程序
+  if lxc exec "$c" -- ps aux | grep -E "sing-box|xray" | grep -v grep >/dev/null 2>&1 &&
+     ! lxc exec "$c" -- ps aux | grep -E "[V]2bX|[X]rayR|sspanel" >/dev/null 2>&1; then
+    NODE_SCORE[$c]=$((NODE_SCORE[$c]-2))
+  fi
+
+  # ------------------------------------------------
+  # 四、输出单容器结果
+  # ------------------------------------------------
+
+  if [ ${PANEL_SCORE[$c]} -ge $THRESHOLD_PANEL ]; then
+    echo "🚨 判定：机场【面板】 (score=${PANEL_SCORE[$c]})"
+  elif [ ${NODE_SCORE[$c]} -ge $THRESHOLD_NODE ]; then
+    echo "⚠️ 判定：机场【节点】 (score=${NODE_SCORE[$c]})"
+  else
+    echo "✅ 未发现机场行为 (panel=${PANEL_SCORE[$c]}, node=${NODE_SCORE[$c]})"
+  fi
+
   echo
 done
 
-echo "=============================================="
-echo "                 审计结果汇总"
-echo "=============================================="
-
-echo
-echo "🚨 运行中的【机场面板】容器："
-if [ ${#PANEL_ACTIVE[@]} -eq 0 ]; then
-  echo "  无"
-else
-  for i in "${PANEL_ACTIVE[@]}"; do
-    echo "  - $i"
-  done
-fi
-
-echo
-echo "⚠️ 运行中的【机场节点（V2bX）】容器："
-if [ ${#NODE_ACTIVE[@]} -eq 0 ]; then
-  echo "  无"
-else
-  for i in "${NODE_ACTIVE[@]}"; do
-    echo "  - $i"
-  done
-fi
-
-echo
-echo "ℹ️ 安装但未运行的 V2bX（仅提示，不报警）："
-if [ ${#NODE_INACTIVE[@]} -eq 0 ]; then
-  echo "  无"
-else
-  for i in "${NODE_INACTIVE[@]}"; do
-    echo "  - $i"
-  done
-fi
-
-echo
-echo "✅ 审计完成（v3 FINAL：仅报告真实机场行为）"
+echo "=================================================="
+echo " 审计完成：仅高置信机场行为被标记"
+echo "=================================================="
