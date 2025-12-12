@@ -43,32 +43,9 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/war
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/swap.sh)
 ```
-# OpenGFW 一键清理工具
 
-## 🚀 一键执行命令
-
-复制下面命令即可一键清理 OpenGFW：
-
+## 🚀 机场面板排查一键执行命令
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/uninstall_opengfw.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/1.sh)
 ```
 
-## 📄 功能
-
-- 自动停止 OpenGFW 服务  
-- 自动删除 systemd 残留  
-- 自动杀掉进程  
-- 自动删除目录  
-- 自动检测运行状态  
-
-# RFW一键防火墙脚本
-
-## 🚀 一键执行命令
-
-复制下面命令即可一键运行RFW：
-
-```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/uninstall-opengfw/main/rfw.sh)
-```
-
-## 📄 功能
