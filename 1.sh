@@ -1,142 +1,115 @@
 #!/bin/bash
 # =====================================================
-# LXC 机场服务审计工具 v7.1 FINAL
-# 严格区分【机场节点】与【自建代理】
+# LXC 机场服务审计工具 v8 FINAL
+# 覆盖所有机场形态，防误杀自建代理
 # =====================================================
 
-# ---------- 阈值 ----------
-THRESHOLD_CONFIRMED=6
-THRESHOLD_SUSPECT=4
-
-# ---------- 搜索配置 ----------
 SEARCH_PATHS="/etc /opt /usr/local/etc /root"
-KEYWORDS="panel_url|node_id|token|api_key|subscribe|v2board|xboard|sspanel|xrayr|v2bx"
+NODE_BIN_KEYWORDS="XrayR|V2bX|soga|sspanel-node|airun|anxray"
+PANEL_KEYWORDS="panel_url|node_id|token|api_key|webapi|backend_url|ppanel|soga|v2board|xboard|sspanel|subscribe"
+EXCLUDE_UI="x-ui|3x-ui|v2ray-ui|hiddify"
 EXCLUDE_FILES="geoip.dat|geosite.dat|\\.mmdb$"
 
-# ---------- 工具函数 ----------
-exec_safe() {
-  local c="$1"
-  local bin="$2"
-  local cmd="$3"
-  lxc exec "$c" -- sh -c "command -v $bin >/dev/null 2>&1 && $cmd" 2>/dev/null
-}
-
 echo "======================================================"
-echo " LXC 机场服务审计工具 (v7.1 FINAL)"
+echo " LXC 机场服务审计工具 v8 FINAL"
 echo "======================================================"
 echo
 
 CONFIRMED=()
 SUSPECT=()
 
-# ---------- 主循环 ----------
-for c in $(lxc list -c n --format csv); do
-  echo "🔍 正在审计容器：$c"
+exec_safe() {
+  lxc exec "$1" -- sh -c "command -v $2 >/dev/null 2>&1 && $3" 2>/dev/null
+}
 
-  # ---------- 正确判断运行状态（关键修复点） ----------
+for c in $(lxc list -c n --format csv); do
+  echo "🔍 审计容器：$c"
+
   STATE=$(lxc list "$c" -c s --format csv 2>/dev/null)
   if [ "$STATE" != "RUNNING" ]; then
-    echo "⏸ 容器未运行（状态：$STATE），跳过"
-    echo
-    continue
+    echo "⏸ 未运行（$STATE），仅做静态审计"
   fi
 
-  PANEL_SCORE=0
-  NODE_SCORE=0
-  CONFIG_HIT=0
+  RESULT="CLEAN"
   MATCHED_FILES=()
 
-  # =====================================================
-  # 一、机场面板（非常严格）
-  # =====================================================
-  exec_safe "$c" ps "ps | grep -E 'php-fpm|gunicorn|uwsgi|node .*server' | grep -v grep" \
-  && exec_safe "$c" ps "ps | grep -E 'nginx|apache|caddy|traefik' | grep -v grep" \
-  && exec_safe "$c" find "find / -maxdepth 3 -name artisan 2>/dev/null | grep -q ." \
-  && PANEL_SCORE=6
+  # ---------- 1. 排除 UI 面板 ----------
+  UI_HIT=$(lxc exec "$c" -- sh -c "
+    grep -R -I -l -E '$EXCLUDE_UI' $SEARCH_PATHS 2>/dev/null | head -n 1
+  ")
+  [ -n "$UI_HIT" ] && UI_ONLY=1 || UI_ONLY=0
 
-  # =====================================================
-  # 二、机场节点（只认“机场对接程序”）
-  # =====================================================
-
-  # 1️⃣ 明确机场节点程序（核心）
-  exec_safe "$c" ps "ps | grep -E '[X]rayR|[V]2bX|sspanel-node'" \
-    && NODE_SCORE=$((NODE_SCORE+4))
-
-  # 2️⃣ 面板对接配置（强证据）
-  MATCH_FILES_RAW=$(lxc exec "$c" -- sh -c "
-    grep -R -I -l -E '$KEYWORDS' $SEARCH_PATHS 2>/dev/null \
-    | grep -Ev '$EXCLUDE_FILES' \
-    | head -n 10
+  # ---------- 2. 机场节点程序 ----------
+  NODE_BIN=$(lxc exec "$c" -- sh -c "
+    ls /usr/bin /usr/local/bin /opt /etc 2>/dev/null | grep -Ei '$NODE_BIN_KEYWORDS' | head -n 1
   ")
 
-  if [ -n "$MATCH_FILES_RAW" ]; then
-    CONFIG_HIT=1
-    NODE_SCORE=$((NODE_SCORE+2))
+  # ---------- 3. 机场配置文件 ----------
+  CONFIG_FILES=$(lxc exec "$c" -- sh -c "
+    grep -R -I -l -E '$PANEL_KEYWORDS' $SEARCH_PATHS 2>/dev/null \
+    | grep -Ev '$EXCLUDE_FILES' \
+    | grep -Ev '$EXCLUDE_UI' \
+    | sort -u | head -n 10
+  ")
 
-    while read -r f; do
-      kw=$(lxc exec "$c" -- sh -c "
-        grep -o -E '$KEYWORDS' '$f' 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,\$//'
-      ")
-      MATCHED_FILES+=("$f  [keywords: $kw]")
-    done <<< "$MATCH_FILES_RAW"
+  # ---------- 4. 连接数检测 ----------
+  CUR_CONN=0
+  HIS_CONN=0
+
+  exec_safe "$c" ss "ss -H state established | wc -l" && CUR_CONN=$(lxc exec "$c" -- ss -H state established 2>/dev/null | wc -l)
+  exec_safe "$c" conntrack "conntrack -L 2>/dev/null | wc -l" && HIS_CONN=$(lxc exec "$c" -- conntrack -L 2>/dev/null | wc -l)
+
+  # ---------- 5. 判定逻辑 ----------
+  if [ "$UI_ONLY" -eq 1 ] && [ -z "$NODE_BIN" ]; then
+    RESULT="CLEAN"
+  elif [ -n "$NODE_BIN" ] && [ -n "$CONFIG_FILES" ]; then
+    RESULT="CONFIRMED"
+  elif [ -n "$CONFIG_FILES" ] && [ "$CUR_CONN" -gt 50 ]; then
+    RESULT="CONFIRMED"
+  elif [ -n "$NODE_BIN" ] || [ -n "$CONFIG_FILES" ] || [ "$CUR_CONN" -gt 100 ]; then
+    RESULT="SUSPECT"
   fi
 
-  # 3️⃣ 用户 / 流量缓存（辅助证据）
-  exec_safe "$c" ls "ls /etc | grep -Ei 'xrayr|v2bx|sspanel'" \
-    && NODE_SCORE=$((NODE_SCORE+1))
+  # ---------- 6. 输出 ----------
+  case "$RESULT" in
+    CONFIRMED)
+      echo "🚨 确定：机场服务"
+      CONFIRMED+=("$c")
+      ;;
+    SUSPECT)
+      echo "⚠️ 可疑：疑似机场服务"
+      SUSPECT+=("$c")
+      ;;
+    CLEAN)
+      echo "✅ 未发现机场行为"
+      ;;
+  esac
 
-  # =====================================================
-  # 三、明确排除：仅代理内核（防误杀）
-  # =====================================================
-  exec_safe "$c" ps "ps | grep -E 'xray|sing-box' | grep -v grep" \
-  && ! exec_safe "$c" ps "ps | grep -E '[X]rayR|[V]2bX|sspanel-node'" \
-  && NODE_SCORE=0
+  if [ -n "$CONFIG_FILES" ]; then
+    echo "  📂 命中配置文件："
+    echo "$CONFIG_FILES" | sed 's/^/    - /'
+  fi
 
-  MAX_SCORE=$(( PANEL_SCORE > NODE_SCORE ? PANEL_SCORE : NODE_SCORE ))
-
-  # =====================================================
-  # 四、判定 + 输出
-  # =====================================================
-  if [ "$MAX_SCORE" -ge "$THRESHOLD_CONFIRMED" ]; then
-    echo "🚨 确定：机场服务（score=$MAX_SCORE）"
-    CONFIRMED+=("$c")
-
-    if [ ${#MATCHED_FILES[@]} -gt 0 ]; then
-      echo "  📂 命中配置文件："
-      for f in "${MATCHED_FILES[@]}"; do
-        echo "    - $f"
-      done
-    fi
-
-  elif [ "$MAX_SCORE" -ge "$THRESHOLD_SUSPECT" ] && [ "$CONFIG_HIT" -eq 1 ]; then
-    echo "⚠️ 可疑：疑似机场服务（score=$MAX_SCORE）"
-    SUSPECT+=("$c")
-
-    echo "  📂 可疑配置文件："
-    for f in "${MATCHED_FILES[@]}"; do
-      echo "    - $f"
-    done
-  else
-    echo "✅ 未发现机场行为（panel=$PANEL_SCORE, node=$NODE_SCORE）"
+  if [ "$CUR_CONN" -gt 0 ] || [ "$HIS_CONN" -gt 0 ]; then
+    echo "  📊 连接情况："
+    echo "    - 当前连接数：$CUR_CONN"
+    echo "    - 历史连接数：$HIS_CONN"
   fi
 
   echo
 done
 
-# =====================================================
-# 五、总结
-# =====================================================
 echo "======================================================"
-echo "                审计结果总结"
+echo "               审计结果汇总"
 echo "======================================================"
-echo
 
-echo "🚨【确定机场服务】容器："
+echo
+echo "🚨 确定机场服务容器："
 [ ${#CONFIRMED[@]} -eq 0 ] && echo "  无" || printf "  - %s\n" "${CONFIRMED[@]}"
 
 echo
-echo "⚠️【可疑机场服务】容器："
+echo "⚠️ 可疑机场服务容器："
 [ ${#SUSPECT[@]} -eq 0 ] && echo "  无" || printf "  - %s\n" "${SUSPECT[@]}"
 
 echo
-echo "✅ 审计完成（v7.1 FINAL）"
+echo "✅ 审计完成（v8 FINAL）"
