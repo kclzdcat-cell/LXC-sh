@@ -11,7 +11,7 @@ KEYWORDS="panel_url|node_id|token|api_key|subscribe|v2board|xboard|sspanel|xrayr
 
 echo "======================================================"
 echo " LXC 机场服务审计工具 FINAL"
-echo " 行为 + 配置 + 评分 + 证据输出"
+echo " 行为 + 配置 + 评分 + 证据输出 7.0版本"
 echo "======================================================"
 echo
 
