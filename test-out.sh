@@ -1,115 +1,108 @@
 #!/bin/bash
 set -e
 
-echo "==========================================="
-echo " WireGuard 出口机部署（最终稳定版）"
-echo "==========================================="
+echo "=== WireGuard 出口机部署（最终稳定版）==="
 
-# root
+# 必须 root
 if [ "$(id -u)" != "0" ]; then
-  echo "请使用 root 执行"
+  echo "必须使用 root 执行"
   exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
+# 系统检测
+. /etc/os-release
+echo "系统: $PRETTY_NAME"
 
-# -----------------------------
-# 1. 安装依赖（Debian 12 正确）
-# -----------------------------
+# 更新 & 安装
 apt update
-apt install -y wireguard wireguard-tools iptables iproute2 curl sshpass openssh-client
+apt install -y wireguard iptables iproute2 curl sshpass
 
-# -----------------------------
-# 2. 基础变量
-# -----------------------------
-EXT_IF=$(ip route | awk '/default/ {print $5}')
-WG_PORT=51820
-WG_DIR=/etc/wireguard
-CLIENT_CONF=/root/wg_client.conf
+# 外网网卡
+EXT_IF=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+echo "外网接口: $EXT_IF"
 
-mkdir -p $WG_DIR
-cd $WG_DIR
+# 开启转发（永久）
+cat >/etc/sysctl.d/99-wg-forward.conf <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+sysctl --system >/dev/null
 
-# -----------------------------
-# 3. 生成密钥（如不存在）
-# -----------------------------
-[ -f server.key ] || wg genkey | tee server.key | wg pubkey > server.pub
-[ -f client.key ] || wg genkey | tee client.key | wg pubkey > client.pub
+# 生成密钥
+mkdir -p /etc/wireguard
+cd /etc/wireguard
+umask 077
+
+wg genkey | tee server.key | wg pubkey > server.pub
+wg genkey | tee client.key | wg pubkey > client.pub
 
 SERVER_PRIV=$(cat server.key)
 SERVER_PUB=$(cat server.pub)
 CLIENT_PRIV=$(cat client.key)
 CLIENT_PUB=$(cat client.pub)
 
-PUB_IP=$(curl -4 -s ip.sb)
-
-# -----------------------------
-# 4. 写服务端配置
-# -----------------------------
-cat > wg0.conf <<EOF
+# 写服务端配置
+cat >/etc/wireguard/wg0.conf <<EOF
 [Interface]
-Address = 10.66.66.1/24, fd66::1/64
-ListenPort = ${WG_PORT}
-PrivateKey = ${SERVER_PRIV}
+Address = 10.0.0.1/24, fd10::1/64
+ListenPort = 51820
+PrivateKey = $SERVER_PRIV
 
-PostUp = sysctl -w net.ipv4.ip_forward=1
-PostUp = sysctl -w net.ipv6.conf.all.forwarding=1
-PostUp = iptables -t nat -A POSTROUTING -o ${EXT_IF} -j MASQUERADE
-PostUp = ip6tables -t nat -A POSTROUTING -o ${EXT_IF} -j MASQUERADE
-
-PostDown = iptables -t nat -D POSTROUTING -o ${EXT_IF} -j MASQUERADE
-PostDown = ip6tables -t nat -D POSTROUTING -o ${EXT_IF} -j MASQUERADE
+PostUp   = iptables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
+PostUp   = ip6tables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o $EXT_IF -j MASQUERADE
+PostDown = ip6tables -t nat -D POSTROUTING -o $EXT_IF -j MASQUERADE
 
 [Peer]
-PublicKey = ${CLIENT_PUB}
-AllowedIPs = 10.66.66.2/32, fd66::2/128
+PublicKey = $CLIENT_PUB
+AllowedIPs = 10.0.0.2/32, fd10::2/128
 EOF
 
-# -----------------------------
-# 5. 客户端配置
-# -----------------------------
-cat > ${CLIENT_CONF} <<EOF
+# 启动 WG
+systemctl enable wg-quick@wg0
+systemctl restart wg-quick@wg0
+
+# 生成客户端配置（入口机用）
+PUB_IP=$(curl -4 -s ip.sb)
+
+cat >/root/wg_client.conf <<EOF
 [Interface]
-Address = 10.66.66.2/24, fd66::2/64
-PrivateKey = ${CLIENT_PRIV}
+Address = 10.0.0.2/24, fd10::2/64
+PrivateKey = $CLIENT_PRIV
 DNS = 8.8.8.8, 1.1.1.1
 
 [Peer]
-PublicKey = ${SERVER_PUB}
-Endpoint = ${PUB_IP}:${WG_PORT}
+PublicKey = $SERVER_PUB
+Endpoint = $PUB_IP:51820
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
 
-echo
-echo "⚠️ 即将启动 WireGuard，SSH 可能短暂断开（正常）"
-sleep 5
+echo "客户端配置生成: /root/wg_client.conf"
 
-systemctl enable wg-quick@wg0
-systemctl restart wg-quick@wg0 || true
-
-echo "==========================================="
-echo "出口机部署完成"
-echo "客户端配置：${CLIENT_CONF}"
-echo "==========================================="
-
-# -----------------------------
-# 6. 上传到入口机
-# -----------------------------
-read -p "是否上传客户端配置到入口机？(y/n): " UP
+# 是否上传到入口机
+read -p "是否通过 SSH 上传客户端配置到入口机？(y/n): " UP
 
 if [[ "$UP" =~ ^[Yy]$ ]]; then
   read -p "入口机 IP: " IN_IP
-  read -p "入口机 SSH 用户(默认 root): " IN_USER
+  read -p "SSH 端口(默认22): " IN_PORT
+  IN_PORT=${IN_PORT:-22}
+  read -p "SSH 用户(默认root): " IN_USER
   IN_USER=${IN_USER:-root}
-  read -s -p "入口机 SSH 密码: " IN_PASS
+  read -s -p "SSH 密码: " IN_PASS
   echo
 
-  ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" 2>/dev/null || true
+  mkdir -p /root/.ssh
+  ssh-keygen -R "$IN_IP" >/dev/null 2>&1 || true
+  ssh-keygen -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
 
   sshpass -p "$IN_PASS" scp \
+    -P "$IN_PORT" \
     -o StrictHostKeyChecking=no \
-    ${CLIENT_CONF} ${IN_USER}@${IN_IP}:/root/
+    /root/wg_client.conf \
+    "$IN_USER@$IN_IP:/root/wg_client.conf"
 
-  echo "✅ 已上传到入口机 /root/wg_client.conf"
+  echo "已上传到入口机 /root/wg_client.conf"
 fi
+
+echo "=== 出口机部署完成 ==="
