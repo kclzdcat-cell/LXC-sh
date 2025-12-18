@@ -3,7 +3,7 @@
 echo "==========================================="
 echo "   WireGuard 入口部署 (修复版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：5.0"
+echo "   版本：5.1"
 echo "==========================================="
 
 # 安装WireGuard
@@ -82,16 +82,37 @@ if ip addr show wg0 > /dev/null 2>&1; then
     echo "添加到WireGuard服务器的直接路由..."
     ip route add $WG_SERVER_IP4 via $DEFAULT_GW dev $DEFAULT_IFACE
     
-    # 应用成功的路由配置方法
-    echo "配置IPv4路由..."
-    ip route del default
-    ip route add default dev wg0
-    ip route add default via $DEFAULT_GW dev $DEFAULT_IFACE metric 100
+    # 使用策略路由确保入站连接保持原始IP
+    echo "配置策略路由..."
     
-    # 保护SSH连接
-    echo "保护SSH连接..."
-    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-    iptables -A OUTPUT -p tcp --sport 22 -j ACCEPT
+    # 清除旧的路由规则
+    ip rule del fwmark 22 table main prio 100 2>/dev/null || true
+    ip rule del from all table 200 prio 200 2>/dev/null || true
+    
+    # 清除防火墙标记
+    iptables -t mangle -F 2>/dev/null || true
+    
+    # 标记所有入站TCP和UDP流量（所有端口）
+    echo "标记入站TCP和UDP流量(所有端口)..."
+    iptables -t mangle -A PREROUTING -i $DEFAULT_IFACE -p tcp -j MARK --set-mark 22
+    iptables -t mangle -A PREROUTING -i $DEFAULT_IFACE -p udp -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp -m conntrack --ctstate ESTABLISHED,RELATED -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p udp -m conntrack --ctstate ESTABLISHED,RELATED -j MARK --set-mark 22
+    
+    # 标记的流量走原始路由表
+    echo "配置标记流量走原始路由..."
+    ip rule add fwmark 22 table main prio 100
+    
+    # 创建路由表200用于VPN流量
+    echo "配置VPN路由表..."
+    ip route flush table 200 2>/dev/null || true
+    ip route add default dev wg0 table 200
+    
+    # 非标记流量走VPN
+    ip rule add from all table 200 prio 200
+    
+    # 清除路由缓存
+    ip route flush cache
 else
     echo "错误: wg0接口未创建，请检查配置"
     exit 1
@@ -116,29 +137,50 @@ if [[ "$IPV6_CHOICE" == "1" ]]; then
             echo "配置IPv6路由..."
             echo "原IPv6网关: $DEFAULT_GW6"
             
-            # 添加IPv6 SSH保护
-            ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-            ip6tables -A OUTPUT -p tcp --sport 22 -j ACCEPT 2>/dev/null || true
+            # 添加IPv6连接保护（所有TCP和UDP端口）
+            ip6tables -A INPUT -p tcp -j ACCEPT 2>/dev/null || true
+            ip6tables -A OUTPUT -p tcp -j ACCEPT 2>/dev/null || true
+            ip6tables -A INPUT -p udp -j ACCEPT 2>/dev/null || true
+            ip6tables -A OUTPUT -p udp -j ACCEPT 2>/dev/null || true
             
-            # 删除IPv6默认路由
-            ip -6 route del default 2>/dev/null || true
+            # 清除IPv6路由规则
+            ip -6 rule del fwmark 22 table main prio 100 2>/dev/null || true
+            ip -6 rule del from all table 200 prio 200 2>/dev/null || true
+            
+            # 清除IPv6 mangle表
+            ip6tables -t mangle -F 2>/dev/null || true
+            
+            # 标记所有入站IPv6 TCP和UDP流量
+            echo "标记入站IPv6 TCP和UDP流量(所有端口)..."
+            ip6tables -t mangle -A PREROUTING -i $DEFAULT_IFACE -p tcp -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -A PREROUTING -i $DEFAULT_IFACE -p udp -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -A OUTPUT -p tcp -m conntrack --ctstate ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -A OUTPUT -p udp -m conntrack --ctstate ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
+            
+            # IPv6标记的流量走原始路由表
+            ip -6 rule add fwmark 22 table main prio 100 2>/dev/null || true
+            
+            # 创建IPv6路由表200
+            echo "配置IPv6 VPN路由表..."
+            ip -6 route flush table 200 2>/dev/null || true
             
             # 等待wg0接口启动
             sleep 2
             
             # 检查wg0是否有IPv6地址
             if ip -6 addr show dev wg0 | grep -q 'fd00::' 2>/dev/null; then
-                echo "wg0接口有IPv6地址，配置IPv6路由..."
-                ip -6 route add default dev wg0 metric 1 2>/dev/null || true
+                echo "wg0接口有IPv6地址，配置IPv6 VPN路由..."
+                ip -6 route add default dev wg0 table 200 2>/dev/null || true
             else
-                echo "wg0接口没有IPv6地址，使用替代方案..."
-                # 使用路由表方式
-                ip -6 rule add from all table 200 prio 100 2>/dev/null || true
+                echo "wg0接口没有IPv6地址，但仍尝试配置IPv6 VPN路由..."
                 ip -6 route add default dev wg0 table 200 2>/dev/null || true
             fi
             
-            # 添加备用IPv6路由（更高metric）
-            ip -6 route add default via $DEFAULT_GW6 dev $DEFAULT_IFACE metric 100 2>/dev/null || true
+            # 非标记IPv6流量走VPN
+            ip -6 rule add from all table 200 prio 200 2>/dev/null || true
+            
+            # 清除IPv6路由缓存
+            ip -6 route flush cache 2>/dev/null || true
             
             # 检查wg0是否有IPv6地址
             if ip -6 addr show dev wg0 | grep -q 'inet6' 2>/dev/null; then
