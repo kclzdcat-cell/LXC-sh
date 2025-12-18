@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (简化版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：2.2"
+echo "   版本：2.3"
 echo "==========================================="
 
 # 0. 权限检查
@@ -37,15 +37,44 @@ if command -v curl >/dev/null 2>&1; then
     echo "curl 已安装"
 fi
 
-# 先清除可能的锁文件
+# 检测系统版本
+DISTRO=""
+VERSION=""
+UBUNTU_CODENAME=""
+
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO=$ID
+    VERSION=$VERSION_ID
+    UBUNTU_CODENAME=$VERSION_CODENAME
+fi
+
+echo "检测到系统: $DISTRO $VERSION ($UBUNTU_CODENAME)"
+
+# 强力修复dpkg问题
+echo ">>> 强力修复dpkg问题..."
+
+# 清除所有锁文件
+echo "清除所有锁文件..."
 rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
 rm -f /var/lib/dpkg/lock 2>/dev/null || true
+rm -f /var/lib/dpkg/lock-* 2>/dev/null || true
 rm -f /var/cache/apt/archives/lock 2>/dev/null || true
 rm -f /var/lib/apt/lists/lock 2>/dev/null || true
 
-# 修复可能的dpkg问题
-dpkg --configure -a 2>/dev/null || true
+# 强制重新配置包
+echo "强制重新配置包..."
+dpkg --configure -a --force-confold 2>/dev/null || true
+
+# 尝试修复损坏的包
+echo "尝试修复损坏的包..."
 apt-get -f install -y 2>/dev/null || true
+
+# 清除可能的损坏的列表
+echo "清除可能的损坏的列表..."
+rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+apt-get clean 2>/dev/null || true
+apt-get update --fix-missing 2>/dev/null || true
 
 # 尝试更新和安装软件
 echo ">>> 更新软件源..."
@@ -53,20 +82,90 @@ apt-get update -y || echo "警告: apt update 失败，继续执行"
 
 if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
     echo ">>> 安装 OpenVPN..."
-    apt-get install -y openvpn || echo "警告: apt安装OpenVPN失败，尝试直接下载"
     
-    # 再次检查是否安装成功
+    # 先再次尝试修复dpkg问题
+    echo "再次尝试修复dpkg问题..."
+    rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
+    rm -f /var/lib/dpkg/lock 2>/dev/null || true
+    rm -f /var/lib/dpkg/lock-* 2>/dev/null || true
+    dpkg --configure -a --force-confold 2>/dev/null || true
+    apt-get -f install -y 2>/dev/null || true
+    
+    # 尝试使用apt安装
+    echo "尝试使用apt安装OpenVPN..."
+    apt-get install -y openvpn || echo "警告: apt安装OpenVPN失败，尝试其他方法"
+    
+    # 检查是否安装成功
     if ! command -v openvpn >/dev/null 2>&1; then
         echo "尝试使用备用方法安装OpenVPN..."
         
         # 尝试下载预编译的包
+        echo "尝试下载预编译的包..."
         cd /tmp
-        curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null || \
-        curl -s -L -o openvpn.deb "http://archive.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null || \
-        curl -s -L -o openvpn.deb "http://security.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null
         
+        # 根据系统版本选择不同的包
+        if [[ "$UBUNTU_CODENAME" == "noble" ]]; then
+            echo "检测到Ubuntu Noble，尝试下载兼容包..."
+            curl -s -L -o openvpn.deb "http://archive.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.6.0-1ubuntu1_amd64.deb" 2>/dev/null || \
+            curl -s -L -o openvpn.deb "http://security.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.6.0-1ubuntu1_amd64.deb" 2>/dev/null || \
+            curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_2.6.0-1ubuntu1_amd64.deb" 2>/dev/null
+        else
+            echo "尝试下载通用OpenVPN包..."
+            curl -s -L -o openvpn.deb "http://archive.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null || \
+            curl -s -L -o openvpn.deb "http://security.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null || \
+            curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null
+        fi
+        
+        # 如果下载成功，尝试安装
         if [ -f openvpn.deb ]; then
+            echo "尝试安装下载的OpenVPN包..."
             dpkg -i openvpn.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
+            
+            # 如果安装失败，尝试先安装依赖
+            if ! command -v openvpn >/dev/null 2>&1; then
+                echo "尝试安装OpenVPN依赖..."
+                apt-get install -y liblz4-1 liblzo2-2 libpkcs11-helper1 libssl1.1 libsystemd0 2>/dev/null || true
+                dpkg -i openvpn.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
+            fi
+        fi
+        
+        # 如果仍然失败，尝试使用预编译的二进制文件
+        if ! command -v openvpn >/dev/null 2>&1; then
+            echo "尝试使用预编译的二进制文件..."
+            
+            cd /tmp
+            # 下载预编译的OpenVPN二进制文件
+            curl -s -L -o openvpn-static.tar.gz "https://swupdate.openvpn.org/community/releases/openvpn-2.5.8.tar.gz" 2>/dev/null || \
+            curl -s -L -o openvpn-static.tar.gz "https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable.tar.gz" 2>/dev/null
+            
+            if [ -f openvpn-static.tar.gz ]; then
+                mkdir -p openvpn-extract
+                tar -xzf openvpn-static.tar.gz -C openvpn-extract 2>/dev/null || true
+                
+                # 尝试找到并复制openvpn二进制文件
+                find openvpn-extract -name "openvpn" -type f -executable -exec cp {} /usr/sbin/openvpn \; 2>/dev/null || true
+                
+                # 设置权限
+                if [ -f /usr/sbin/openvpn ]; then
+                    chmod 755 /usr/sbin/openvpn
+                    ln -sf /usr/sbin/openvpn /usr/bin/openvpn 2>/dev/null || true
+                fi
+            fi
+        fi
+        
+        # 如果仍然失败，尝试使用源码编译
+        if ! command -v openvpn >/dev/null 2>&1; then
+            echo "尝试使用源码编译安装OpenVPN..."
+            
+            # 安装编译工具
+            apt-get install -y build-essential libssl-dev liblzo2-dev libpam0g-dev libpkcs11-helper1-dev 2>/dev/null || true
+            
+            # 下载和编译OpenVPN
+            cd /tmp
+            curl -s -L -o openvpn-2.4.7.tar.gz "https://swupdate.openvpn.org/community/releases/openvpn-2.4.7.tar.gz" 2>/dev/null
+            tar -xzf openvpn-2.4.7.tar.gz 2>/dev/null
+            cd openvpn-2.4.7 2>/dev/null
+            ./configure 2>/dev/null && make 2>/dev/null && make install 2>/dev/null
         fi
     fi
     
@@ -354,6 +453,7 @@ fi
 echo ">>> 重启OpenVPN服务..."
 
 # 确保OpenVPN服务目录存在
+echo ">>> 创建OpenVPN目录和服务文件..."
 mkdir -p /etc/openvpn/client/scripts 2>/dev/null || true
 mkdir -p /var/log/openvpn 2>/dev/null || true
 mkdir -p /run/openvpn 2>/dev/null || true
@@ -376,6 +476,35 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 fi
+
+# 创建OpenVPN客户端服务文件
+if [ ! -f /lib/systemd/system/openvpn-client@.service ] && [ -d /lib/systemd/system ]; then
+    echo "创建OpenVPN客户端服务文件..."
+    cat > /lib/systemd/system/openvpn-client@.service <<EOF
+[Unit]
+Description=OpenVPN tunnel for %I
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/openvpn --daemon --writepid /run/openvpn/%i.pid --cd /etc/openvpn/client -c %i.conf
+PIDFile=/run/openvpn/%i.pid
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+# 创建相关目录的符号链接
+if [ ! -d /etc/openvpn/client ]; then
+    mkdir -p /etc/openvpn/client 2>/dev/null || true
+fi
+
+# 确保所有目录权限正确
+chmod 755 /etc/openvpn 2>/dev/null || true
+chmod 755 /etc/openvpn/client 2>/dev/null || true
+chmod 755 /etc/openvpn/client/scripts 2>/dev/null || true
 
 # 重启服务
 systemctl daemon-reload
