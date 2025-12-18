@@ -1,58 +1,56 @@
 #!/bin/bash
 set -e
 
-echo "==========================================="
-echo " WireGuard 入口机部署（客户端）"
-echo "==========================================="
+echo "=== WireGuard 入口机部署（SSH 安全最终版）==="
 
+# root 检查
 if [ "$(id -u)" != "0" ]; then
-  echo "请使用 root 执行"
+  echo "必须 root 执行"
   exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-
-# -----------------------------
-# 1. 安装依赖
-# -----------------------------
-apt update
-apt install -y wireguard wireguard-tools iproute2 iptables curl
-
-# -----------------------------
-# 2. 检查配置
-# -----------------------------
+# 必须有客户端配置
 if [ ! -f /root/wg_client.conf ]; then
-  echo "❌ 未找到 /root/wg_client.conf"
+  echo "缺少 /root/wg_client.conf"
   exit 1
 fi
 
+# 安装依赖
+apt update
+apt install -y wireguard iproute2 iptables curl
+
+# 记录当前 SSH 对端 IP（关键）
+SSH_IP=$(echo "$SSH_CLIENT" | awk '{print $1}')
+
+if [ -z "$SSH_IP" ]; then
+  echo "未检测到 SSH_CLIENT，可能不是通过 SSH 登录，终止"
+  exit 1
+fi
+
+echo "SSH 对端 IP: $SSH_IP"
+
+# 写 WG 配置
 mkdir -p /etc/wireguard
 cp /root/wg_client.conf /etc/wireguard/wg0.conf
 chmod 600 /etc/wireguard/wg0.conf
 
-# -----------------------------
-# 3. 启动 WireGuard
-# -----------------------------
+# 添加 SSH 保护路由（最关键的一行）
+ip rule add to $SSH_IP lookup main priority 100 2>/dev/null || true
+
+# 启动 WG
 systemctl enable wg-quick@wg0
 systemctl restart wg-quick@wg0
 
-sleep 3
+sleep 2
 
-# -----------------------------
-# 4. 验证
-# -----------------------------
-echo "WireGuard 状态："
+echo "=== 验证 ==="
 wg show
 
-echo
-echo "IPv4 出口："
+echo "--- 出口 IPv4 ---"
 curl -4 ip.sb || true
 
-echo "IPv6 出口："
+echo "--- 出口 IPv6 ---"
 curl -6 ip.sb || true
 
-echo "==========================================="
-echo "入口机完成："
-echo "- 入站不变"
-echo "- 所有出站已走出口机"
-echo "==========================================="
+echo "=== 入口机部署完成 ==="
+echo "SSH 已被保护，不会断"
