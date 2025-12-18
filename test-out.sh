@@ -1,9 +1,9 @@
 #!/bin/bash
 
 echo "==========================================="
-echo "   WireGuard 出口部署 (极简版)"
+echo "   WireGuard 出口部署 (修复版)"
 echo "   功能：作为VPN出口服务器"
-echo "   版本：2.0"
+echo "   版本：4.0"
 echo "==========================================="
 
 # 安装WireGuard
@@ -11,10 +11,10 @@ echo ">>> 安装WireGuard..."
 apt-get update
 apt-get install -y wireguard iptables curl
 
-# 获取公网IP
-echo ">>> 获取公网IP..."
-PUBLIC_IP=$(curl -s ip.sb)
-echo "公网IP: $PUBLIC_IP"
+# 获取公网IPv4
+echo ">>> 获取公网IPv4..."
+PUBLIC_IP4=$(curl -4s ip.sb || curl -4s ifconfig.me || curl -4s icanhazip.com)
+echo "公网IPv4: $PUBLIC_IP4"
 
 # 获取默认网卡
 DEFAULT_IFACE=$(ip -4 route | grep default | awk '{print $5}' | head -n 1)
@@ -22,10 +22,13 @@ echo "默认网卡: $DEFAULT_IFACE"
 
 # 生成密钥
 echo ">>> 生成密钥..."
+umask 077
 mkdir -p /etc/wireguard
 cd /etc/wireguard
-wg genkey | tee server_private.key | wg pubkey > server_public.key
-wg genkey | tee client_private.key | wg pubkey > client_public.key
+wg genkey > server_private.key
+wg pubkey < server_private.key > server_public.key
+wg genkey > client_private.key
+wg pubkey < client_private.key > client_public.key
 
 SERVER_PRIVATE_KEY=$(cat server_private.key)
 SERVER_PUBLIC_KEY=$(cat server_public.key)
@@ -43,15 +46,6 @@ Address = 10.0.0.1/24
 ListenPort = 51820
 PrivateKey = $SERVER_PRIVATE_KEY
 
-# 启用转发
-PostUp = sysctl -w net.ipv4.ip_forward=1
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
-
-# 清理规则
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
-
 [Peer]
 PublicKey = $CLIENT_PUBLIC_KEY
 AllowedIPs = 10.0.0.2/32
@@ -67,7 +61,7 @@ DNS = 8.8.8.8, 1.1.1.1
 
 [Peer]
 PublicKey = $SERVER_PUBLIC_KEY
-Endpoint = $PUBLIC_IP:51820
+Endpoint = $PUBLIC_IP4:51820
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
@@ -76,6 +70,11 @@ EOF
 echo ">>> 启用IP转发..."
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-wireguard.conf
 sysctl -p /etc/sysctl.d/99-wireguard.conf
+
+# 配置NAT
+echo ">>> 配置NAT..."
+iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
+iptables -A FORWARD -i wg0 -j ACCEPT
 
 # 启动WireGuard
 echo ">>> 启动WireGuard..."
