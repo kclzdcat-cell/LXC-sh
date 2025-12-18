@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (简化版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：2.3"
+echo "   版本：3.0 (nftables增强版)"
 echo "==========================================="
 
 # 0. 权限检查
@@ -19,6 +19,7 @@ echo ">>> 安装必要软件..."
 # 检查软件是否已安装
 OPENVPN_INSTALLED=0
 IPTABLES_INSTALLED=0
+NFTABLES_INSTALLED=0
 CURL_INSTALLED=0
 HOST_INSTALLED=0
 
@@ -30,6 +31,11 @@ fi
 if command -v iptables >/dev/null 2>&1; then
     IPTABLES_INSTALLED=1
     echo "iptables 已安装"
+fi
+
+if command -v nft >/dev/null 2>&1; then
+    NFTABLES_INSTALLED=1
+    echo "nftables 已安装"
 fi
 
 if command -v curl >/dev/null 2>&1; then
@@ -179,7 +185,25 @@ if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
     fi
 fi
 
-if [[ $IPTABLES_INSTALLED -eq 0 ]]; then
+# 尝试安装nftables
+if [[ $NFTABLES_INSTALLED -eq 0 ]]; then
+    echo ">>> 安装 nftables..."
+    apt-get install -y nftables || echo "警告: apt安装nftables失败"
+    
+    # 再次检查是否安装成功
+    if command -v nft >/dev/null 2>&1; then
+        echo "nftables 安装成功"
+        NFTABLES_INSTALLED=1
+        # 启用nftables服务
+        systemctl enable nftables 2>/dev/null || true
+        systemctl start nftables 2>/dev/null || true
+    else
+        echo "警告: 无法安装nftables，将使用iptables"
+    fi
+fi
+
+# 如果nftables安装失败，则安装iptables
+if [[ $NFTABLES_INSTALLED -eq 0 && $IPTABLES_INSTALLED -eq 0 ]]; then
     echo ">>> 安装 iptables..."
     apt-get install -y iptables iptables-persistent || echo "警告: apt安装iptables失败"
     
@@ -253,6 +277,15 @@ echo ">>> 创建路由脚本..."
 cat > /etc/openvpn/client/scripts/route-up.sh <<'SCRIPT'
 #!/bin/bash
 
+# 检查是否安装了nftables
+USE_NFTABLES=0
+if command -v nft >/dev/null 2>&1; then
+    USE_NFTABLES=1
+    echo "[路由配置] 使用nftables进行流量控制"
+else
+    echo "[路由配置] 使用iptables进行流量控制"
+fi
+
 # 获取网卡信息
 DEV4=$(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1)
 GW4=$(ip -4 route | grep default | grep -v tun | awk '{print $3}' | head -n 1)
@@ -265,9 +298,46 @@ echo "[路由配置] 清除旧的路由规则..."
 ip rule del fwmark 22 table main prio 100 2>/dev/null || true
 ip rule del from all table 200 prio 200 2>/dev/null || true
 
+# 清除旧的防火墙规则
+if [ $USE_NFTABLES -eq 1 ]; then
+    echo "[路由配置] 清除nftables规则..."
+    # 删除现有的表（如果存在）
+    nft delete table inet vpn 2>/dev/null || true
+    
+    # 创建新表和链
+    echo "[路由配置] 创建nftables表和链..."
+    nft add table inet vpn
+    nft add chain inet vpn prerouting { type filter hook prerouting priority 0 \; }
+    nft add chain inet vpn postrouting { type filter hook postrouting priority 0 \; }
+    nft add chain inet vpn input { type filter hook input priority 0 \; }
+    nft add chain inet vpn output { type filter hook output priority 0 \; }
+    
+    # 标记所有TCP入站连接
+    echo "[路由配置] 标记所有TCP入站连接(nft)..."
+    nft add rule inet vpn input ip protocol tcp counter meta mark set 22
+    nft add rule inet vpn input ip6 nexthdr tcp counter meta mark set 22
+    nft add rule inet vpn output ip protocol tcp ct state related,established counter meta mark set 22
+    nft add rule inet vpn output ip6 nexthdr tcp ct state related,established counter meta mark set 22
+else
+    echo "[路由配置] 清除iptables规则..."
+    iptables -t mangle -F 2>/dev/null || true
+    ip6tables -t mangle -F 2>/dev/null || true
+    
+    # 标记所有TCP入站连接
+    echo "[路由配置] 标记所有TCP入站连接(iptables)..."
+    iptables -t mangle -A INPUT -p tcp -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22
+    
+    # 如果有IPv6，也标记IPv6流量
+    if ip -6 addr show dev $DEV4 | grep -q 'inet6' 2>/dev/null; then
+        ip6tables -t mangle -A INPUT -p tcp -j MARK --set-mark 22 2>/dev/null || true
+        ip6tables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
+    fi
+fi
+
 # 先添加到VPN服务器的直接路由
 echo "[路由配置] 添加到VPN服务器的直接路由: $4 via $GW4 dev $DEV4"
-ip route add $4 via $GW4 dev $DEV4
+ip route add $4 via $GW4 dev $DEV4 2>/dev/null || true
 
 # 标记的流量走原始网卡
 echo "[路由配置] 添加标记流量规则..."
@@ -278,19 +348,13 @@ echo "[路由配置] 添加DNS服务器路由..."
 ip rule add to 8.8.8.8/32 table main prio 95
 ip rule add to 1.1.1.1/32 table main prio 95
 
-# 标记所有TCP入站连接
-echo "[路由配置] 标记所有TCP入站连接..."
-iptables -t mangle -F
-iptables -t mangle -A INPUT -p tcp -j MARK --set-mark 22
-iptables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22
-
 # 创建路由表200用于出站流量
 echo "[路由配置] 创建路由表200..."
 ip route flush table 200 2>/dev/null || true
 
 # 添加默认路由到表200
 echo "[路由配置] 添加默认路由到表200: default via $5 dev $1"
-ip route add default via $5 dev $1 table 200
+ip route add default via $5 dev $1 table 200 2>/dev/null || true
 
 # 非标记流量走VPN
 echo "[路由配置] 添加非标记流量规则..."
@@ -309,7 +373,7 @@ echo "[路由配置] 路由表200:"
 ip route show table 200
 
 # IPv6配置
-if ip -6 addr show dev $DEV4 | grep -q 'inet6'; then
+if ip -6 addr show dev $DEV4 | grep -q 'inet6' 2>/dev/null; then
     # 获取IPv6网关
     GW6=$(ip -6 route | grep default | grep -v tun | awk '{print $3}' | head -n 1)
     
@@ -323,16 +387,11 @@ if ip -6 addr show dev $DEV4 | grep -q 'inet6'; then
         # 创建路由表200用于IPv6出站流量
         ip -6 route flush table 200 2>/dev/null || true
         
-        # 标记所有IPv6入站连接
-        ip6tables -t mangle -F 2>/dev/null || true
-        ip6tables -t mangle -A INPUT -p tcp -j MARK --set-mark 22 2>/dev/null || true
-        ip6tables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
-        
         # 标记的IPv6流量走原始网卡
         ip -6 rule add fwmark 22 table main prio 100 2>/dev/null || true
         
         # 添加IPv6默认路由到表200
-        if ip -6 addr show dev tun0 | grep -q 'inet6'; then
+        if ip -6 addr show dev tun0 | grep -q 'inet6' 2>/dev/null; then
             echo "[路由配置] 添加IPv6默认路由到表200"
             ip -6 route add default dev tun0 table 200 2>/dev/null || true
             
@@ -350,29 +409,66 @@ if ip -6 addr show dev $DEV4 | grep -q 'inet6'; then
 else
     echo "[路由配置] 未检测到IPv6接口，跳过IPv6路由配置"
 fi
+
+# 添加NAT规则
+if [ $USE_NFTABLES -eq 1 ]; then
+    echo "[路由配置] 添加nftables NAT规则..."
+    nft add table nat
+    nft add chain nat postrouting { type nat hook postrouting priority 100 \; }
+    nft add rule nat postrouting oifname "tun0" counter masquerade
+else
+    echo "[路由配置] 添加iptables NAT规则..."
+    iptables -t nat -F 2>/dev/null || true
+    iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || true
+fi
 SCRIPT
 
 # 创建关闭脚本
 cat > /etc/openvpn/client/scripts/down.sh <<'SCRIPT'
 #!/bin/bash
 
+# 检查是否安装了nftables
+USE_NFTABLES=0
+if command -v nft >/dev/null 2>&1; then
+    USE_NFTABLES=1
+    echo "[清理] 使用nftables清理规则"
+else
+    echo "[清理] 使用iptables清理规则"
+fi
+
 # 清除所有添加的规则和表
+echo "[清理] 清除路由规则..."
 ip rule del from all table 200 prio 200 2>/dev/null || true
 ip rule del fwmark 22 table main prio 100 2>/dev/null || true
 ip rule del to 8.8.8.8/32 table main prio 95 2>/dev/null || true
 ip rule del to 1.1.1.1/32 table main prio 95 2>/dev/null || true
 
 # 清除IPv6规则(如果存在)
+echo "[清理] 清除IPv6路由规则..."
 ip -6 rule del from all table 200 prio 200 2>/dev/null || true
 ip -6 rule del fwmark 22 table main prio 100 2>/dev/null || true
 
 # 清除路由表
+echo "[清理] 清除路由表..."
 ip route flush table 200 2>/dev/null || true
 ip -6 route flush table 200 2>/dev/null || true
 
-# 清除iptables规则
-iptables -t mangle -F
-ip6tables -t mangle -F 2>/dev/null || true
+# 清除防火墙规则
+if [ $USE_NFTABLES -eq 1 ]; then
+    echo "[清理] 清除nftables规则..."
+    # 删除nftables表
+    nft delete table inet vpn 2>/dev/null || true
+    nft delete table nat 2>/dev/null || true
+else
+    echo "[清理] 清除iptables规则..."
+    iptables -t mangle -F 2>/dev/null || true
+    iptables -t nat -F 2>/dev/null || true
+    ip6tables -t mangle -F 2>/dev/null || true
+fi
+
+# 恢复原始路由
+echo "[清理] 恢复原始路由..."
+ip route flush cache
 SCRIPT
 
 # 设置脚本权限
@@ -439,14 +535,37 @@ sysctl -p >/dev/null 2>&1
 
 # 7. 配置NAT
 echo ">>> 配置NAT规则..."
-iptables -t nat -F
-iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
 
-# 保存防火墙规则
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4
-if command -v ip6tables-save >/dev/null 2>&1; then
-    ip6tables-save > /etc/iptables/rules.v6
+# 检查是否使用nftables
+if [[ $NFTABLES_INSTALLED -eq 1 ]]; then
+    echo ">>> 使用nftables配置NAT..."
+    
+    # 清除现有的nftables规则
+    nft flush ruleset 2>/dev/null || true
+    
+    # 创建NAT规则
+    nft add table nat
+    nft add chain nat postrouting { type nat hook postrouting priority 100 \; }
+    nft add rule nat postrouting oifname "tun0" counter masquerade
+    
+    # 保存nftables规则
+    mkdir -p /etc/nftables
+    nft list ruleset > /etc/nftables/nftables.conf
+    
+    # 启用nftables服务
+    systemctl enable nftables 2>/dev/null || true
+    systemctl restart nftables 2>/dev/null || true
+else
+    echo ">>> 使用iptables配置NAT..."
+    iptables -t nat -F
+    iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
+    
+    # 保存防火墙规则
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4
+    if command -v ip6tables-save >/dev/null 2>&1; then
+        ip6tables-save > /etc/iptables/rules.v6
+    fi
 fi
 
 # 8. 重启OpenVPN服务
@@ -574,6 +693,33 @@ echo "当前IPv4出口IP: $CURRENT_IP4"
 if [ "$CURRENT_IP4" = "$ORIG_IP4" ] && [ "$CURRENT_IP4" != "无法获取" ]; then
     echo ">>> 警告: 出口IP与原始IP相同，尝试修复路由..."
     
+    # 检查tun0接口状态
+    echo ">>> 检查tun0接口详细状态..."
+    ip addr show tun0
+    
+    # 检查OpenVPN连接状态
+    echo ">>> 检查OpenVPN日志..."
+    tail -n 20 /var/log/syslog | grep -i openvpn || echo "无OpenVPN日志信息"
+    
+    # 检查路由表
+    echo ">>> 检查路由表详情..."
+    ip route
+    ip route show table 200
+    ip rule show
+    
+    # 检查防火墙规则
+    if [[ $NFTABLES_INSTALLED -eq 1 ]]; then
+        echo ">>> 检查nftables规则..."
+        nft list ruleset
+    else
+        echo ">>> 检查iptables规则..."
+        iptables -t mangle -L -v -n
+        iptables -t nat -L -v -n
+    fi
+    
+    # 尝试修复路由
+    echo ">>> 尝试修复路由..."
+    
     # 获取tun0网关
     TUN_GW=$(ip -4 route | grep "dev tun0" | grep -v "via" | head -n 1 | awk '{print $1}')
     if [ -n "$TUN_GW" ]; then
@@ -588,6 +734,30 @@ if [ "$CURRENT_IP4" = "$ORIG_IP4" ] && [ "$CURRENT_IP4" != "无法获取" ]; the
         sleep 3
         CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
         echo "重新配置后的出口IPv4: $CURRENT_IP4"
+    else
+        # 如果没有tun0网关，尝试直接使用tun0接口
+        echo "尝试直接使用tun0接口作为默认路由..."
+        ip route flush table 200
+        ip rule del table 200 2>/dev/null || true
+        ip rule add from all table 200 prio 200
+        ip route add default dev tun0 table 200
+        ip route flush cache
+        
+        # 再次检查出口IP
+        sleep 3
+        CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
+        echo "直接使用tun0后的出口IPv4: $CURRENT_IP4"
+    fi
+    
+    # 如果仍然失败，尝试重启OpenVPN
+    if [ "$CURRENT_IP4" = "$ORIG_IP4" ] || [ "$CURRENT_IP4" = "无法获取" ]; then
+        echo ">>> 尝试重启OpenVPN服务..."
+        systemctl restart openvpn-client@client
+        sleep 5
+        
+        # 再次检查出口IP
+        CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
+        echo "重启OpenVPN后的出口IPv4: $CURRENT_IP4"
     fi
 fi
 
