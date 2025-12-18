@@ -17,13 +17,13 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/mem
 # 出口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/out.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/test-out.sh)
 ```
 
 # 入口部署
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/in.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/test-in.sh)
 ```
 
 ## 🌏warp版
