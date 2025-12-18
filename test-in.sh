@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   功版本：1.1"
+echo "   版本：1.2"
 echo "==========================================="
 
 # 0. 权限检查
@@ -13,13 +13,70 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 1. 安装必要软件
-echo ">>> 更新系统并安装组件..."
-# 尝试修复可能的 dpkg 锁
-rm /var/lib/dpkg/lock-frontend 2>/dev/null || true
-rm /var/lib/dpkg/lock 2>/dev/null || true
-apt update -y
-apt install -y openvpn iptables iptables-persistent curl
+# 1. 检查必要软件
+echo ">>> 检查必要软件..."
+
+# 检查软件是否已安装
+OPENVPN_INSTALLED=0
+IPTABLES_INSTALLED=0
+CURL_INSTALLED=0
+
+if command -v openvpn >/dev/null 2>&1; then
+    OPENVPN_INSTALLED=1
+    echo "OpenVPN 已安装"
+fi
+
+if command -v iptables >/dev/null 2>&1; then
+    IPTABLES_INSTALLED=1
+    echo "iptables 已安装"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    CURL_INSTALLED=1
+    echo "curl 已安装"
+fi
+
+# 检查是否需要安装软件
+if [[ $OPENVPN_INSTALLED -eq 0 || $IPTABLES_INSTALLED -eq 0 || $CURL_INSTALLED -eq 0 ]]; then
+    echo "警告: 检测到缺失的软件包。"
+    read -p "是否尝试更新和安装缺失的软件包? [y/N] " INSTALL_CHOICE
+    
+    if [[ "$INSTALL_CHOICE" == "y" || "$INSTALL_CHOICE" == "Y" ]]; then
+        echo ">>> 尝试更新系统并安装缺失组件..."
+        # 尝试修复可能的 dpkg 锁
+        rm /var/lib/dpkg/lock-frontend 2>/dev/null || true
+        rm /var/lib/dpkg/lock 2>/dev/null || true
+        
+        # 尝试更新，忽略错误
+        apt update -y || echo "警告: apt update 失败，继续执行脚本"
+        
+        # 尝试安装缺失的软件
+        if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
+            apt install -y openvpn || echo "警告: openvpn 安装失败"
+        fi
+        
+        if [[ $IPTABLES_INSTALLED -eq 0 ]]; then
+            apt install -y iptables || echo "警告: iptables 安装失败"
+            apt install -y iptables-persistent || echo "警告: iptables-persistent 安装失败"
+        fi
+        
+        if [[ $CURL_INSTALLED -eq 0 ]]; then
+            apt install -y curl || echo "警告: curl 安装失败"
+        fi
+    else
+        echo "跳过安装步骤，继续执行脚本..."
+    fi
+fi
+
+# 再次检查关键软件
+if ! command -v openvpn >/dev/null 2>&1; then
+    echo "错误：OpenVPN未安装，脚本可能无法正常工作。"
+    read -p "是否继续执行? [y/N] " CONTINUE_CHOICE
+    if [[ "$CONTINUE_CHOICE" != "y" && "$CONTINUE_CHOICE" != "Y" ]]; then
+        echo "退出脚本。"
+        exit 1
+    fi
+fi
 
 # 2. 检查 client.ovpn
 if [ ! -f /root/client.ovpn ]; then
