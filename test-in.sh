@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   版本：1.6（解决openvpn失败问题）"
+echo "   版本：1.7（解决openvpn失败问题）"
 echo "==========================================="
 
 # 0. 权限检查
@@ -126,10 +126,19 @@ install_required_packages() {
                 # 手动创建netfilter-persistent命令
                 if ! command -v netfilter-persistent >/dev/null 2>&1; then
                     echo "创建netfilter-persistent命令..."
-                    cat > /usr/sbin/netfilter-persistent <<'EOF'
+                    
+                    # 先尝试安装iptables-persistent包
+                    apt-get install -y iptables-persistent 2>/dev/null || true
+                    
+                    # 如果仍然没有netfilter-persistent命令，手动创建
+                    if ! command -v netfilter-persistent >/dev/null 2>&1; then
+                        mkdir -p /etc/iptables
+                        
+                        cat > /usr/sbin/netfilter-persistent <<'EOF'
 #!/bin/bash
 case "$1" in
   save)
+    mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
     if command -v ip6tables-save >/dev/null 2>&1; then
       ip6tables-save > /etc/iptables/rules.v6
@@ -137,7 +146,9 @@ case "$1" in
     echo "iptables rules saved"
     ;;
   reload)
-    iptables-restore < /etc/iptables/rules.v4
+    if [ -f /etc/iptables/rules.v4 ]; then
+      iptables-restore < /etc/iptables/rules.v4
+    fi
     if command -v ip6tables-restore >/dev/null 2>&1 && [ -f /etc/iptables/rules.v6 ]; then
       ip6tables-restore < /etc/iptables/rules.v6
     fi
@@ -149,8 +160,27 @@ case "$1" in
     ;;
 esac
 EOF
-                    chmod +x /usr/sbin/netfilter-persistent
-                    mkdir -p /etc/iptables
+                        chmod +x /usr/sbin/netfilter-persistent
+                        
+                        # 创建systemd服务
+                        cat > /etc/systemd/system/netfilter-persistent.service <<'EOF'
+[Unit]
+Description=netfilter persistent configuration
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/netfilter-persistent reload
+ExecStop=/usr/sbin/netfilter-persistent save
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                        systemctl daemon-reload
+                        systemctl enable netfilter-persistent
+                    fi
                 fi
                 
                 # 直接尝试下载和安装二进制包
@@ -389,54 +419,19 @@ DEV4=$(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1)
 GW4=$(ip -4 route | grep default | grep -v tun | awk '{print $3}' | head -n 1)
 
 # 清除旧的路由规则
-echo "清除旧的路由规则..."
-ip rule del to 8.8.8.8/32 table main prio 95 2>/dev/null || true
-ip rule del to 1.1.1.1/32 table main prio 95 2>/dev/null || true
-ip rule del to 108.61.196.101/32 table main prio 95 2>/dev/null || true
 ip rule del fwmark 22 table main prio 100 2>/dev/null || true
-ip rule del from all table 200 prio 200 2>/dev/null || true
 
-# 清除路由表
-ip route flush table 200 2>/dev/null || true
+# 添加到VPN服务器的直接路由
+ip route add $4 via $GW4 dev $DEV4
 
-# 确保有到VPN服务器的直接路由
-echo "添加到VPN服务器的直接路由: $4 via $GW4 dev $DEV4"
-ip route add $4 via $GW4 dev $DEV4 2>/dev/null || true
-
-# 添加到DNS服务器的路由
-echo "添加DNS服务器和IP查询服务的路由规则..."
-ip rule add to 8.8.8.8/32 table main prio 95 2>/dev/null || true
-ip rule add to 1.1.1.1/32 table main prio 95 2>/dev/null || true
-ip rule add to 108.61.196.101/32 table main prio 95 2>/dev/null || true
+# 添加DNS服务器的路由
+ip rule add to 8.8.8.8/32 table main prio 95
+ip rule add to 1.1.1.1/32 table main prio 95
 
 # 标记的流量走原始网卡
-echo "添加标记流量的路由规则..."
-ip rule add fwmark 22 table main prio 100 2>/dev/null || true
-
-# 添加默认路由到表200
-echo "添加默认路由到表200: default via $5 dev $1"
-ip route add default via $5 dev $1 table 200 2>/dev/null || true
-
-# 添加策略路由规则
-echo "添加策略路由规则..."
-ip rule add from all table 200 prio 200 2>/dev/null || true
-
-# 清除路由缓存
-ip route flush cache
-
-# 显示当前路由表状态
-echo "当前路由表状态:"
-ip route show table 200
-echo "当前路由规则:"
-ip rule show
-ip rule add from all to 224.0.0.0/4 table main prio 100 2>/dev/null || true
-ip rule add from all to 255.255.255.255 table main prio 100 2>/dev/null || true
+ip rule add fwmark 22 table main prio 100
 
 # SSH流量标记配置
-
-# 创建规则来处理SSH流量
-# 注意: 这条规则已经在上面添加过了，这里不需要重复添加
-
 if [[ "$SSH_PORT_CHOICE" == "1" ]]; then
     # 选项1: 只标记标准22端口
     echo "只保留标准22端口走原始网卡"
@@ -448,8 +443,8 @@ if [[ "$SSH_PORT_CHOICE" == "1" ]]; then
     iptables -t mangle -A FORWARD -p tcp --dport 22 -j MARK --set-mark 22
 
 elif [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
-    # 选项2: 标准22端口和指定的额外端口
-    echo "保留标准22端口和指定的额外端口"
+    # 选项2: 标记标准22端口和额外端口
+    echo "保留标准22端口和额外SSH端口走原始网卡: $EXTRA_SSH_PORTS"
     # 标记22端口
     iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
     iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
@@ -459,8 +454,8 @@ elif [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
     iptables -t mangle -A FORWARD -p tcp --dport 22 -j MARK --set-mark 22
     
     # 标记额外SSH端口
-    echo "为额外SSH端口添加标记规则：$EXTRA_SSH_PORTS"
     for port in $EXTRA_SSH_PORTS; do
+        echo "标记额外SSH端口: $port"
         iptables -t mangle -A OUTPUT -p tcp --sport $port -j MARK --set-mark 22
         iptables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark 22
         iptables -t mangle -A INPUT -p tcp --sport $port -j MARK --set-mark 22
@@ -470,26 +465,24 @@ elif [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
     done
 
 elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
-    # 选项3: 保留所有TCP端口连接，包括随机分配的SSH端口
+    # 选项3: 保留所有TCP端口连接
     echo "保留所有TCP连接和转发端口"
-    
-    # 1. 标记标准SSH端口
+    # 标记标准SSH端口
     iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
     iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
     iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
     iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
     
-    # 2. 标记所有转发流量
+    # 标记所有转发流量
     iptables -t mangle -A FORWARD -p tcp -j MARK --set-mark 22
     
-    # 3. 标记所有来自外部的新连接(即入站连接)
+    # 标记所有入站连接
     iptables -t mangle -A INPUT -p tcp -m state --state NEW -j MARK --set-mark 22
 fi
+SCRIPT
 
-# 注意: 这些规则已经在route-up.sh脚本中添加过了
 # 清除路由缓存
 ip route flush cache
-SCRIPT
 
 # 创建关闭脚本
 cat > /etc/openvpn/client/scripts/down.sh <<'SCRIPT'
@@ -664,10 +657,71 @@ sysctl -p >/dev/null 2>&1
 
 # 6. 配置 NAT (只针对 IPv4)
 echo ">>> 配置防火墙 NAT..."
+
+# 清除旧规则
 iptables -t nat -F
-# 允许 tun0 出流量伪装
+iptables -t mangle -F
+
+# 创建NAT规则 - 简化版本
 iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
-netfilter-persistent save
+
+# 创建防火墙规则
+if [[ "$SSH_PORT_CHOICE" == "1" ]]; then
+    # 选项1: 只标记标准22端口
+    echo "只保留标准22端口走原始网卡"
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+
+elif [[ "$SSH_PORT_CHOICE" == "2" ]]; then
+    # 选项2: 标记标准22端口和额外端口
+    echo "保留标准22端口和额外SSH端口走原始网卡: $EXTRA_SSH_PORTS"
+    
+    # 标记标准22端口
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+    
+    # 标记额外SSH端口
+    for port in $EXTRA_SSH_PORTS; do
+        echo "标记额外SSH端口: $port"
+        iptables -t mangle -A OUTPUT -p tcp --sport $port -j MARK --set-mark 22
+        iptables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark 22
+        iptables -t mangle -A INPUT -p tcp --sport $port -j MARK --set-mark 22
+        iptables -t mangle -A INPUT -p tcp --dport $port -j MARK --set-mark 22
+    done
+
+elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
+    # 选项3: 保留所有TCP端口连接，包括随机分配的SSH端口
+    echo "保留所有TCP连接和转发端口"
+    
+    # 1. 标记标准SSH端口
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+    
+    # 2. 标记所有转发流量
+    iptables -t mangle -A FORWARD -p tcp -j MARK --set-mark 22
+    
+    # 3. 标记所有来自外部的新连接(即入站连接)
+    iptables -t mangle -A INPUT -p tcp -m state --state NEW -j MARK --set-mark 22
+fi
+
+# 保存防火墙规则
+echo ">>> 保存防火墙规则..."
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4
+if command -v ip6tables-save >/dev/null 2>&1; then
+    ip6tables-save > /etc/iptables/rules.v6
+fi
+
+# 尝试使用netfilter-persistent保存规则
+if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save || true
+fi
 
 # 7. 重启服务
 echo ">>> 重启 OpenVPN 服务..."
