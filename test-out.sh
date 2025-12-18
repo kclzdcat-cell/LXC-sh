@@ -114,7 +114,7 @@ if [[ "$UPLOAD_CHOICE" == "y" || "$UPLOAD_CHOICE" == "Y" ]]; then
     ENTRY_USER=${ENTRY_USER:-root}
 
     echo "请输入入口机的ssh密码:"
-    read -r ENTER_PAWD
+    read -r ENTER_PASSWORD
     
     echo "正在上传客户端配置到入口机..."
     scp -P "$ENTRY_PORT" /root/wg_client.conf "$ENTRY_USER@$ENTRY_IP:/root/wg_client.conf"
