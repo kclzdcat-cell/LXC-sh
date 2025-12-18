@@ -2,9 +2,9 @@
 set -e
 
 echo "==========================================="
-echo "   WireGuard 入口部署"
+echo "   WireGuard 入口部署 (修复版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：1.0"
+echo "   版本：1.1"
 echo "==========================================="
 
 # 0. 权限检查
@@ -119,192 +119,15 @@ cp /root/wg_client.conf /etc/wireguard/wg0.conf
 # 4. 创建路由脚本
 echo ">>> 创建路由脚本..."
 
+# 创建scripts目录
+mkdir -p /etc/wireguard/scripts
+
 # 提取WireGuard服务器IP和端口
 WG_SERVER_IP=$(grep "Endpoint" /etc/wireguard/wg0.conf | awk '{print $3}' | cut -d':' -f1)
 WG_SERVER_PORT=$(grep "Endpoint" /etc/wireguard/wg0.conf | awk '{print $3}' | cut -d':' -f2)
 
 echo "WireGuard服务器IP: $WG_SERVER_IP"
 echo "WireGuard服务器端口: $WG_SERVER_PORT"
-
-# 创建启动脚本
-cat > /etc/wireguard/scripts/route-up.sh <<'SCRIPT'
-#!/bin/bash
-
-# 获取网卡信息
-DEV4=$(ip -4 route | grep default | grep -v wg | awk '{print $5}' | head -n 1)
-GW4=$(ip -4 route | grep default | grep -v wg | awk '{print $3}' | head -n 1)
-
-echo "[路由配置] 原始网卡: $DEV4, 网关: $GW4"
-
-# 清除旧的路由规则
-echo "[路由配置] 清除旧的路由规则..."
-ip rule del fwmark 22 table main prio 100 2>/dev/null || true
-ip rule del from all table 200 prio 200 2>/dev/null || true
-
-# 清除旧的防火墙规则
-echo "[路由配置] 清除iptables规则..."
-iptables -t mangle -F 2>/dev/null || true
-iptables -t nat -F 2>/dev/null || true
-ip6tables -t mangle -F 2>/dev/null || true
-ip6tables -t nat -F 2>/dev/null || true
-
-# 首先保护SSH连接
-echo "[路由配置] 保护SSH连接..."
-# 获取当前SSH端口
-SSH_PORT=22  # 默认SSH端口
-if netstat -tnlp 2>/dev/null | grep -q sshd; then
-    SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | grep -oE '[0-9]+' | head -n 1)
-    echo "[路由配置] 检测到SSH端口: $SSH_PORT"
-fi
-
-# 先添加SSH规则，确保SSH不会断开
-iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
-iptables -A OUTPUT -p tcp --sport $SSH_PORT -j ACCEPT
-
-# 对所有SSH相关流量进行标记
-iptables -t mangle -A INPUT -p tcp --dport $SSH_PORT -j MARK --set-mark 22
-iptables -t mangle -A OUTPUT -p tcp --sport $SSH_PORT -j MARK --set-mark 22
-
-# 标记所有TCP入站连接
-echo "[路由配置] 标记所有TCP入站连接..."
-iptables -t mangle -A INPUT -p tcp -j MARK --set-mark 22
-iptables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22
-
-# 如果有IPv6，也标记IPv6流量
-if ip -6 addr show dev $DEV4 | grep -q 'inet6' 2>/dev/null; then
-    # 保护IPv6 SSH连接
-    ip6tables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || true
-    ip6tables -A OUTPUT -p tcp --sport $SSH_PORT -j ACCEPT 2>/dev/null || true
-    
-    # 标记IPv6流量
-    ip6tables -t mangle -A INPUT -p tcp --dport $SSH_PORT -j MARK --set-mark 22 2>/dev/null || true
-    ip6tables -t mangle -A OUTPUT -p tcp --sport $SSH_PORT -j MARK --set-mark 22 2>/dev/null || true
-    ip6tables -t mangle -A INPUT -p tcp -j MARK --set-mark 22 2>/dev/null || true
-    ip6tables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
-fi
-
-# 获取WireGuard服务器IP
-WG_SERVER_IP=$(grep "Endpoint" /etc/wireguard/wg0.conf | awk '{print $3}' | cut -d':' -f1)
-
-# 先添加到WireGuard服务器的直接路由
-echo "[路由配置] 添加到WireGuard服务器的直接路由: $WG_SERVER_IP via $GW4 dev $DEV4"
-ip route add $WG_SERVER_IP via $GW4 dev $DEV4 2>/dev/null || true
-
-# 标记的流量走原始网卡
-echo "[路由配置] 添加标记流量规则..."
-ip rule add fwmark 22 table main prio 100
-
-# 添加DNS服务器的路由
-echo "[路由配置] 添加DNS服务器路由..."
-ip rule add to 8.8.8.8/32 table main prio 95
-ip rule add to 1.1.1.1/32 table main prio 95
-
-# 创建路由表200用于出站流量
-echo "[路由配置] 创建路由表200..."
-ip route flush table 200 2>/dev/null || true
-
-# 添加默认路由到表200
-echo "[路由配置] 添加默认路由到表200: default dev wg0"
-ip route add default dev wg0 table 200 2>/dev/null || true
-
-# 非标记流量走WireGuard
-echo "[路由配置] 添加非标记流量规则..."
-ip rule add from all table 200 prio 200
-
-# 清除路由缓存
-echo "[路由配置] 清除路由缓存..."
-ip route flush cache
-
-# 显示路由规则
-echo "[路由配置] 当前路由规则:"
-ip rule show
-
-# 显示路由表
-echo "[路由配置] 路由表200:"
-ip route show table 200
-
-# IPv6配置
-if ip -6 addr show dev $DEV4 | grep -q 'inet6' 2>/dev/null; then
-    # 获取IPv6网关
-    GW6=$(ip -6 route | grep default | grep -v wg | awk '{print $3}' | head -n 1)
-    
-    if [ -n "$GW6" ]; then
-        echo "[路由配置] IPv6网关: $GW6"
-        
-        # 清除旧的IPv6路由规则
-        ip -6 rule del fwmark 22 table main prio 100 2>/dev/null || true
-        ip -6 rule del from all table 200 prio 200 2>/dev/null || true
-        
-        # 创建路由表200用于IPv6出站流量
-        ip -6 route flush table 200 2>/dev/null || true
-        
-        # 标记的IPv6流量走原始网卡
-        ip -6 rule add fwmark 22 table main prio 100 2>/dev/null || true
-        
-        # 添加IPv6默认路由到表200
-        if ip -6 addr show dev wg0 | grep -q 'inet6' 2>/dev/null; then
-            echo "[路由配置] 添加IPv6默认路由到表200"
-            ip -6 route add default dev wg0 table 200 2>/dev/null || true
-            
-            # 非标记IPv6流量走WireGuard
-            ip -6 rule add from all table 200 prio 200 2>/dev/null || true
-            
-            # 清除IPv6路由缓存
-            ip -6 route flush cache 2>/dev/null || true
-        else
-            echo "[路由配置] wg0接口没有IPv6地址，跳过IPv6路由配置"
-        fi
-    else
-        echo "[路由配置] 未检测到IPv6网关，跳过IPv6路由配置"
-    fi
-else
-    echo "[路由配置] 未检测到IPv6接口，跳过IPv6路由配置"
-fi
-SCRIPT
-
-# 创建关闭脚本
-cat > /etc/wireguard/scripts/down.sh <<'SCRIPT'
-#!/bin/bash
-
-# 清除所有添加的规则和表
-echo "[清理] 清除路由规则..."
-ip rule del from all table 200 prio 200 2>/dev/null || true
-ip rule del fwmark 22 table main prio 100 2>/dev/null || true
-ip rule del to 8.8.8.8/32 table main prio 95 2>/dev/null || true
-ip rule del to 1.1.1.1/32 table main prio 95 2>/dev/null || true
-
-# 清除IPv6规则(如果存在)
-echo "[清理] 清除IPv6路由规则..."
-ip -6 rule del from all table 200 prio 200 2>/dev/null || true
-ip -6 rule del fwmark 22 table main prio 100 2>/dev/null || true
-
-# 清除路由表
-echo "[清理] 清除路由表..."
-ip route flush table 200 2>/dev/null || true
-ip -6 route flush table 200 2>/dev/null || true
-
-# 清除iptables规则
-echo "[清理] 清除iptables规则..."
-iptables -t mangle -F 2>/dev/null || true
-iptables -t nat -F 2>/dev/null || true
-iptables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-iptables -D OUTPUT -p tcp --sport 22 -j ACCEPT 2>/dev/null || true
-
-# 清除ip6tables规则
-echo "[清理] 清除ip6tables规则..."
-ip6tables -t mangle -F 2>/dev/null || true
-ip6tables -t nat -F 2>/dev/null || true
-ip6tables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-ip6tables -D OUTPUT -p tcp --sport 22 -j ACCEPT 2>/dev/null || true
-
-# 恢复原始路由
-echo "[清理] 恢复原始路由..."
-ip route flush cache
-SCRIPT
-
-# 设置脚本权限
-mkdir -p /etc/wireguard/scripts
-chmod +x /etc/wireguard/scripts/*.sh
 
 # 5. 修改WireGuard配置
 echo ">>> 修改WireGuard配置..."
@@ -314,8 +137,14 @@ if ! grep -q "PostUp" /etc/wireguard/wg0.conf; then
     # 备份原始配置
     cp /etc/wireguard/wg0.conf /etc/wireguard/wg0.conf.bak
     
-    # 修改配置文件
-    sed -i '/\[Interface\]/a PostUp = /etc/wireguard/scripts/route-up.sh\nPostDown = /etc/wireguard/scripts/down.sh' /etc/wireguard/wg0.conf
+    # 创建简化版的配置文件
+    cat > /etc/wireguard/wg0.conf <<EOF
+$(cat /etc/wireguard/wg0.conf)
+
+# 添加NAT规则
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $(ip -4 route | grep default | awk '{print $5}' | head -n 1) -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $(ip -4 route | grep default | awk '{print $5}' | head -n 1) -j MASQUERADE
+EOF
 fi
 
 # 6. 配置系统参数
@@ -333,33 +162,12 @@ fi
 
 sysctl -p >/dev/null 2>&1
 
-# 7. 配置NAT
-echo ">>> 配置NAT规则..."
-
-echo ">>> 使用iptables配置NAT..."
-iptables -t nat -F
-iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
-
-# 如果有IPv6，添加IPv6 NAT规则
-if ip -6 addr show | grep -q 'inet6' 2>/dev/null; then
-    echo ">>> 配置IPv6 NAT规则..."
-    ip6tables -t nat -F 2>/dev/null || true
-    ip6tables -t nat -A POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true
-fi
-
-# 保存防火墙规则
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4
-if command -v ip6tables-save >/dev/null 2>&1; then
-    ip6tables-save > /etc/iptables/rules.v6
-fi
-
-# 8. 启动WireGuard服务
+# 7. 启动WireGuard服务
 echo ">>> 启动WireGuard服务..."
 systemctl enable wg-quick@wg0
 systemctl restart wg-quick@wg0
 
-# 9. 等待并验证
+# 8. 等待并验证
 echo ">>> 等待连接建立 (10秒)..."
 sleep 10
 
@@ -394,79 +202,30 @@ fi
 echo ">>> 检测原始IPv4..."
 ORIG_DEV=$(ip -4 route | grep default | grep -v wg | awk '{print $5}' | head -n 1)
 echo "原始网卡: $ORIG_DEV"
-ORIG_IP4=$(curl -4s --interface $ORIG_DEV --connect-timeout 5 ip.sb || echo "无法获取")
+ORIG_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
 echo "原始IPv4: $ORIG_IP4"
-
-# 检查wg0接口IP
-echo ">>> 检测wg0接口IPv4..."
-if ip addr show wg0 > /dev/null 2>&1; then
-    WG_IP4=$(curl -4s --interface wg0 --connect-timeout 5 ip.sb || echo "无法获取")
-    echo "wg0接口IPv4: $WG_IP4"
-else
-    echo "wg0接口不存在"
-fi
 
 # 检查当前出口IP
 echo ">>> 检测当前出口IPv4..."
 CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
 echo "当前IPv4出口IP: $CURRENT_IP4"
 
-# 如果出口IP与原始IP相同，尝试修复路由
+# 如果出口IP与原始IP相同，尝试修复
 if [ "$CURRENT_IP4" = "$ORIG_IP4" ] && [ "$CURRENT_IP4" != "无法获取" ]; then
-    echo ">>> 警告: 出口IP与原始IP相同，尝试修复路由..."
+    echo ">>> 警告: 出口IP与原始IP相同，尝试修复..."
     
-    # 检查wg0接口状态
-    echo ">>> 检查wg0接口详细状态..."
-    ip addr show wg0
-    
-    # 检查WireGuard连接状态
+    # 检查WireGuard状态
     echo ">>> 检查WireGuard状态..."
     wg show
     
-    # 检查路由表
-    echo ">>> 检查路由表详情..."
-    ip route
-    ip route show table 200
-    ip rule show
-    
-    # 检查防火墙规则
-    echo ">>> 检查iptables规则..."
-    iptables -t mangle -L -v -n
-    iptables -t nat -L -v -n
-    
-    # 检查IPv6防火墙规则
-    if ip -6 addr show | grep -q 'inet6' 2>/dev/null; then
-        echo ">>> 检查ip6tables规则..."
-        ip6tables -t mangle -L -v -n 2>/dev/null || true
-        ip6tables -t nat -L -v -n 2>/dev/null || true
-    fi
-    
-    # 尝试修复路由
-    echo ">>> 尝试修复路由..."
-    
-    # 重新配置路由表
-    echo "重新配置路由表..."
-    ip route flush table 200
-    ip rule del table 200 2>/dev/null || true
-    ip rule add from all table 200 prio 200
-    ip route add default dev wg0 table 200
-    ip route flush cache
+    # 尝试重启WireGuard
+    echo ">>> 尝试重启WireGuard服务..."
+    systemctl restart wg-quick@wg0
+    sleep 5
     
     # 再次检查出口IP
-    sleep 3
     CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
-    echo "重新配置后的出口IPv4: $CURRENT_IP4"
-    
-    # 如果仍然失败，尝试重启WireGuard
-    if [ "$CURRENT_IP4" = "$ORIG_IP4" ] || [ "$CURRENT_IP4" = "无法获取" ]; then
-        echo ">>> 尝试重启WireGuard服务..."
-        systemctl restart wg-quick@wg0
-        sleep 5
-        
-        # 再次检查出口IP
-        CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
-        echo "重启WireGuard后的出口IPv4: $CURRENT_IP4"
-    fi
+    echo "重启WireGuard后的出口IPv4: $CURRENT_IP4"
 fi
 
 # 检查IPv6出口
@@ -476,14 +235,6 @@ if [ "$CURRENT_IP6" != "无法获取" ]; then
     echo "当前IPv6出口IP: $CURRENT_IP6"
 else
     echo "未检测到IPv6出口IP"
-fi
-
-# 检查DNS解析
-echo ">>> 检查DNS解析..."
-if [[ $HOST_INSTALLED -eq 1 ]]; then
-    host -t A google.com || echo "DNS解析失败"
-else
-    echo "host命令未安装，跳过DNS解析测试"
 fi
 
 # 测试连接性
