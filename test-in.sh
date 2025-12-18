@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   版本：1.3(无需内网)"
+echo "   版本：1.4"
 echo "==========================================="
 
 # 0. 权限检查
@@ -13,8 +13,22 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 1. 检查必要软件
-echo ">>> 检查必要软件..."
+# 1. 系统检测和软件安装
+echo ">>> 系统检测和软件安装..."
+
+# 检测系统版本
+DISTRO=""
+VERSION=""
+UBUNTU_CODENAME=""
+
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO=$ID
+    VERSION=$VERSION_ID
+    UBUNTU_CODENAME=$VERSION_CODENAME
+fi
+
+echo "检测到系统: $DISTRO $VERSION ($UBUNTU_CODENAME)"
 
 # 检查软件是否已安装
 OPENVPN_INSTALLED=0
@@ -36,33 +50,95 @@ if command -v curl >/dev/null 2>&1; then
     echo "curl 已安装"
 fi
 
-# 检查是否需要安装软件
-if [[ $OPENVPN_INSTALLED -eq 0 || $IPTABLES_INSTALLED -eq 0 || $CURL_INSTALLED -eq 0 ]]; then
-    echo "警告: 检测到缺失的软件包。"
-    read -p "是否尝试更新和安装缺失的软件包? [y/N] " INSTALL_CHOICE
+install_required_packages() {
+    local MISSING_PACKAGES=""
     
-    if [[ "$INSTALL_CHOICE" == "y" || "$INSTALL_CHOICE" == "Y" ]]; then
-        echo ">>> 尝试更新系统并安装缺失组件..."
+    if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
+        MISSING_PACKAGES="$MISSING_PACKAGES openvpn"
+    fi
+    
+    if [[ $IPTABLES_INSTALLED -eq 0 ]]; then
+        MISSING_PACKAGES="$MISSING_PACKAGES iptables iptables-persistent"
+    fi
+    
+    if [[ $CURL_INSTALLED -eq 0 ]]; then
+        MISSING_PACKAGES="$MISSING_PACKAGES curl"
+    fi
+    
+    if [[ -n "$MISSING_PACKAGES" ]]; then
+        echo "尝试安装缺失的软件包: $MISSING_PACKAGES"
+        
         # 尝试修复可能的 dpkg 锁
         rm /var/lib/dpkg/lock-frontend 2>/dev/null || true
         rm /var/lib/dpkg/lock 2>/dev/null || true
         
-        # 尝试更新，忽略错误
-        apt update -y || echo "警告: apt update 失败，继续执行脚本"
-        
-        # 尝试安装缺失的软件
-        if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
-            apt install -y openvpn || echo "警告: openvpn 安装失败"
+        # 针对不同系统采用不同的安装方式
+        if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
+            # Ubuntu/Debian系统
+            if [[ "$UBUNTU_CODENAME" == "oracular" ]]; then
+                # 特殊处理oracular版本 (旧版本或不支持的版本)
+                echo "检测到Ubuntu oracular版本，正在使用备用安装方法..."
+                
+                # 直接尝试下载和安装二进制包
+                if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
+                    echo "尝试直接安装OpenVPN..."
+                    # 使用dpkg直接安装
+                    cd /tmp
+                    curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_2.5.0-1ubuntu1_amd64.deb" 2>/dev/null
+                    dpkg -i openvpn.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
+                    # 检查是否安装成功
+                    if command -v openvpn >/dev/null 2>&1; then
+                        OPENVPN_INSTALLED=1
+                        echo "OpenVPN 安装成功"
+                    else
+                        echo "警告: OpenVPN安装失败"
+                    fi
+                fi
+                
+                # 直接确保iptables已安装 (通常基本系统已安装)
+                if [[ $CURL_INSTALLED -eq 0 ]]; then
+                    echo "尝试直接安装curl..."
+                    cd /tmp
+                    curl -s -L -o curl.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/c/curl/curl_7.74.0-1ubuntu2_amd64.deb" 2>/dev/null || wget -q "https://mirrors.edge.kernel.org/ubuntu/pool/main/c/curl/curl_7.74.0-1ubuntu2_amd64.deb" -O curl.deb
+                    dpkg -i curl.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
+                    # 检查是否安装成功
+                    if command -v curl >/dev/null 2>&1; then
+                        CURL_INSTALLED=1
+                        echo "curl 安装成功"
+                    else
+                        echo "警告: curl安装失败"
+                    fi
+                fi
+            else
+                # 其他Ubuntu/Debian版本
+                apt-get update -y || echo "警告: apt update 失败，继续执行"
+                apt-get install -y $MISSING_PACKAGES || echo "警告: 部分软件包安装失败"
+            fi
+        elif [[ "$DISTRO" == "centos" || "$DISTRO" == "rhel" || "$DISTRO" == "fedora" ]]; then
+            # CentOS/RHEL/Fedora系统
+            yum -y update || echo "警告: yum update 失败，继续执行"
+            yum -y install epel-release || echo "警告: epel-release 安装失败"
+            yum -y install openvpn iptables curl || echo "警告: 部分软件包安装失败"
+        else
+            echo "未知系统类型: $DISTRO，尝试使用apt..."
+            apt-get update -y || echo "警告: apt update 失败，继续执行"
+            apt-get install -y $MISSING_PACKAGES || echo "警告: 部分软件包安装失败"
         fi
         
-        if [[ $IPTABLES_INSTALLED -eq 0 ]]; then
-            apt install -y iptables || echo "警告: iptables 安装失败"
-            apt install -y iptables-persistent || echo "警告: iptables-persistent 安装失败"
-        fi
-        
-        if [[ $CURL_INSTALLED -eq 0 ]]; then
-            apt install -y curl || echo "警告: curl 安装失败"
-        fi
+        # 检查是否安装成功
+        if command -v openvpn >/dev/null 2>&1; then OPENVPN_INSTALLED=1; fi
+        if command -v iptables >/dev/null 2>&1; then IPTABLES_INSTALLED=1; fi
+        if command -v curl >/dev/null 2>&1; then CURL_INSTALLED=1; fi
+    fi
+}
+
+# 检查是否需要安装软件
+if [[ $OPENVPN_INSTALLED -eq 0 || $IPTABLES_INSTALLED -eq 0 || $CURL_INSTALLED -eq 0 ]]; then
+    echo "警告: 检测到缺失的软件包。"
+    read -p "是否尝试安装缺失的软件包? [Y/n] " INSTALL_CHOICE
+    
+    if [[ -z "$INSTALL_CHOICE" || "$INSTALL_CHOICE" == "y" || "$INSTALL_CHOICE" == "Y" ]]; then
+        install_required_packages
     else
         echo "跳过安装步骤，继续执行脚本..."
     fi
