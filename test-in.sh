@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   版本：1.2"
+echo "   版本：1.3"
 echo "==========================================="
 
 # 0. 权限检查
@@ -124,11 +124,16 @@ IPV6_CHOICE=${IPV6_CHOICE:-1}
 echo -e "\nSSH端口设置:\n"
 echo "1) 只保留标准SSH端口(22)走原始网卡"
 echo "2) 保留所有SSH相关端口(包括转发到LXC容器的端口)走原始网卡"
-read -p "请选择SSH端口处理方式 [1/2] (默认:2): " SSH_PORT_CHOICE
-SSH_PORT_CHOICE=${SSH_PORT_CHOICE:-2}
+echo "3) 保留所有TCP端口连接走原始网卡(适用于随机分配的端口)"
+read -p "请选择SSH端口处理方式 [1/2/3] (默认:3): " SSH_PORT_CHOICE
+SSH_PORT_CHOICE=${SSH_PORT_CHOICE:-3}
 
 if [[ "$SSH_PORT_CHOICE" == "2" ]]; then
     read -p "请输入需要保留的额外SSH端口(以空格分隔，例如 '2222 2223 2224'): " EXTRA_SSH_PORTS
+elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
+    echo "将保留所有TCP端口连接，包括随机分配的SSH端口"
+    read -p "请输入LXC容器内网IP范围(默认: 10.0.0.0/8): " LXC_IP_RANGE
+    LXC_IP_RANGE=${LXC_IP_RANGE:-"10.0.0.0/8"}
 fi
 
 # 创建启动脚本
@@ -168,13 +173,33 @@ ip rule add to 108.61.196.101/32 table main prio 95  # ip.sb
 ip rule add from all to 224.0.0.0/4 table main prio 100
 ip rule add from all to 255.255.255.255 table main prio 100
 
-# 让SSH流量保持直连 - 标准22端口
-ip rule add fwmark 22 table main prio 100
-iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
-iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+# SSH流量标记配置
 
-# 处理额外的SSH端口
-if [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
+# 创建规则来处理SSH流量
+ip rule add fwmark 22 table main prio 100
+
+if [[ "$SSH_PORT_CHOICE" == "1" ]]; then
+    # 选项1: 只标记标准22端口
+    echo "只保留标准22端口走原始网卡"
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A FORWARD -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A FORWARD -p tcp --dport 22 -j MARK --set-mark 22
+
+elif [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
+    # 选项2: 标准22端口和指定的额外端口
+    echo "保留标准22端口和指定的额外端口"
+    # 标记22端口
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A FORWARD -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A FORWARD -p tcp --dport 22 -j MARK --set-mark 22
+    
+    # 标记额外SSH端口
     echo "为额外SSH端口添加标记规则：$EXTRA_SSH_PORTS"
     for port in $EXTRA_SSH_PORTS; do
         iptables -t mangle -A OUTPUT -p tcp --sport $port -j MARK --set-mark 22
@@ -184,6 +209,23 @@ if [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
         iptables -t mangle -A FORWARD -p tcp --sport $port -j MARK --set-mark 22
         iptables -t mangle -A FORWARD -p tcp --dport $port -j MARK --set-mark 22
     done
+
+elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
+    # 选项3: 保留所有TCP端口连接，包括随机分配的SSH端口
+    echo "保留所有TCP连接，特别是到$LXC_IP_RANGE的连接"
+    
+    # 1. 标记所有到LXC容器的TCP流量
+    iptables -t mangle -A FORWARD -p tcp -d $LXC_IP_RANGE -j MARK --set-mark 22
+    iptables -t mangle -A FORWARD -p tcp -s $LXC_IP_RANGE -j MARK --set-mark 22
+    
+    # 2. 标记标准SSH端口和其他常用需要保留的端口
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
+    iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+    
+    # 3. 标记所有来自外部的新连接(即入站连接)
+    iptables -t mangle -A INPUT -p tcp -m state --state NEW -j MARK --set-mark 22
 fi
 
 # 其他所有流量走VPN
@@ -213,22 +255,54 @@ ip -6 rule del from all table 200 prio 200 2>/dev/null || true
 ip -6 rule del fwmark 22 table main prio 100 2>/dev/null || true
 
 # 清除标准SSH端口的iptables标记规则
-iptables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
-ip6tables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
-ip6tables -t mangle -D OUTPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
-
-# 处理额外的SSH端口
-if [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
-    echo "清除额外SSH端口的标记规则..."
-    for port in $EXTRA_SSH_PORTS; do
-        iptables -t mangle -D OUTPUT -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
-        iptables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
-        iptables -t mangle -D INPUT -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
-        iptables -t mangle -D INPUT -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
-        iptables -t mangle -D FORWARD -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
-        iptables -t mangle -D FORWARD -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
-    done
+if [[ "$SSH_PORT_CHOICE" == "1" || "$SSH_PORT_CHOICE" == "2" ]]; then
+    # 清除标准22端口规则
+    iptables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D INPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D INPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D FORWARD -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D FORWARD -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    
+    ip6tables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip6tables -t mangle -D INPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip6tables -t mangle -D INPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip6tables -t mangle -D FORWARD -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip6tables -t mangle -D FORWARD -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    
+    # 处理额外的SSH端口
+    if [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
+        echo "清除额外SSH端口的标记规则..."
+        for port in $EXTRA_SSH_PORTS; do
+            iptables -t mangle -D OUTPUT -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
+            iptables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
+            iptables -t mangle -D INPUT -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
+            iptables -t mangle -D INPUT -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
+            iptables -t mangle -D FORWARD -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
+            iptables -t mangle -D FORWARD -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
+            
+            ip6tables -t mangle -D OUTPUT -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -D INPUT -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -D INPUT -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -D FORWARD -p tcp --sport $port -j MARK --set-mark 22 2>/dev/null || true
+            ip6tables -t mangle -D FORWARD -p tcp --dport $port -j MARK --set-mark 22 2>/dev/null || true
+        done
+    fi
+elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
+    # 清除标准22端口规则
+    iptables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D INPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D INPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    
+    # 清除到LXC容器的TCP流量规则
+    iptables -t mangle -D FORWARD -p tcp -d $LXC_IP_RANGE -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D FORWARD -p tcp -s $LXC_IP_RANGE -j MARK --set-mark 22 2>/dev/null || true
+    
+    # 清除新连接标记规则
+    iptables -t mangle -D INPUT -p tcp -m state --state NEW -j MARK --set-mark 22 2>/dev/null || true
 fi
 SCRIPT
 
@@ -349,6 +423,7 @@ systemctl restart openvpn-client@client
 cat > /etc/openvpn/client/scripts/ssh_ports.conf <<EOF
 SSH_PORT_CHOICE="$SSH_PORT_CHOICE"
 EXTRA_SSH_PORTS="$EXTRA_SSH_PORTS"
+LXC_IP_RANGE="$LXC_IP_RANGE"
 EOF
 
 # 8. 应用IPv6配置
@@ -445,6 +520,9 @@ if [[ "$SSH_PORT_CHOICE" == "1" ]]; then
     echo "   标准SSH端口(22)应保持正常连接。本机原始IP保持可访问。"
 elif [[ "$SSH_PORT_CHOICE" == "2" ]]; then
     echo "   SSH端口(22 及 $EXTRA_SSH_PORTS)应保持正常连接。本机原始IP保持可访问。"
-    echo "   LXC容器的转发SSH端口也应正常工作。"
+    echo "   指定的LXC容器转发SSH端口应正常工作。"
+elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
+    echo "   所有入站TCP连接（包括随机分配的SSH端口）都应保持正常。"
+    echo "   所有LXC容器的转发连接应能正常工作。"
 fi
 echo "==========================================="
