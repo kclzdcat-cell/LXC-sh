@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   版本：1.3"
+echo "   版本：1.3(无需内网)"
 echo "==========================================="
 
 # 0. 权限检查
@@ -132,8 +132,6 @@ if [[ "$SSH_PORT_CHOICE" == "2" ]]; then
     read -p "请输入需要保留的额外SSH端口(以空格分隔，例如 '2222 2223 2224'): " EXTRA_SSH_PORTS
 elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
     echo "将保留所有TCP端口连接，包括随机分配的SSH端口"
-    read -p "请输入LXC容器内网IP范围(默认: 10.0.0.0/8): " LXC_IP_RANGE
-    LXC_IP_RANGE=${LXC_IP_RANGE:-"10.0.0.0/8"}
 fi
 
 # 创建启动脚本
@@ -212,17 +210,16 @@ elif [[ "$SSH_PORT_CHOICE" == "2" && -n "$EXTRA_SSH_PORTS" ]]; then
 
 elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
     # 选项3: 保留所有TCP端口连接，包括随机分配的SSH端口
-    echo "保留所有TCP连接，特别是到$LXC_IP_RANGE的连接"
+    echo "保留所有TCP连接和转发端口"
     
-    # 1. 标记所有到LXC容器的TCP流量
-    iptables -t mangle -A FORWARD -p tcp -d $LXC_IP_RANGE -j MARK --set-mark 22
-    iptables -t mangle -A FORWARD -p tcp -s $LXC_IP_RANGE -j MARK --set-mark 22
-    
-    # 2. 标记标准SSH端口和其他常用需要保留的端口
+    # 1. 标记标准SSH端口
     iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22
     iptables -t mangle -A OUTPUT -p tcp --dport 22 -j MARK --set-mark 22
     iptables -t mangle -A INPUT -p tcp --sport 22 -j MARK --set-mark 22
     iptables -t mangle -A INPUT -p tcp --dport 22 -j MARK --set-mark 22
+    
+    # 2. 标记所有转发流量
+    iptables -t mangle -A FORWARD -p tcp -j MARK --set-mark 22
     
     # 3. 标记所有来自外部的新连接(即入站连接)
     iptables -t mangle -A INPUT -p tcp -m state --state NEW -j MARK --set-mark 22
@@ -297,9 +294,8 @@ elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
     iptables -t mangle -D INPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
     
-    # 清除到LXC容器的TCP流量规则
-    iptables -t mangle -D FORWARD -p tcp -d $LXC_IP_RANGE -j MARK --set-mark 22 2>/dev/null || true
-    iptables -t mangle -D FORWARD -p tcp -s $LXC_IP_RANGE -j MARK --set-mark 22 2>/dev/null || true
+    # 清除转发规则
+    iptables -t mangle -D FORWARD -p tcp -j MARK --set-mark 22 2>/dev/null || true
     
     # 清除新连接标记规则
     iptables -t mangle -D INPUT -p tcp -m state --state NEW -j MARK --set-mark 22 2>/dev/null || true
@@ -423,7 +419,6 @@ systemctl restart openvpn-client@client
 cat > /etc/openvpn/client/scripts/ssh_ports.conf <<EOF
 SSH_PORT_CHOICE="$SSH_PORT_CHOICE"
 EXTRA_SSH_PORTS="$EXTRA_SSH_PORTS"
-LXC_IP_RANGE="$LXC_IP_RANGE"
 EOF
 
 # 8. 应用IPv6配置
