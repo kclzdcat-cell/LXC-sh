@@ -3,7 +3,7 @@
 echo "==========================================="
 echo "   WireGuard 出口部署 (修复版)"
 echo "   功能：作为VPN出口服务器"
-echo "   版本：4.0"
+echo "   版本：5.0"
 echo "==========================================="
 
 # 安装WireGuard
@@ -42,27 +42,27 @@ echo "客户端公钥: $CLIENT_PUBLIC_KEY"
 echo ">>> 创建服务器配置..."
 cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
-Address = 10.0.0.1/24
+Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 PrivateKey = $SERVER_PRIVATE_KEY
 
 [Peer]
 PublicKey = $CLIENT_PUBLIC_KEY
-AllowedIPs = 10.0.0.2/32
+AllowedIPs = 10.0.0.2/32, fd00::2/128
 EOF
 
 # 创建客户端配置
 echo ">>> 创建客户端配置..."
 cat > /root/wg_client.conf <<EOF
 [Interface]
-Address = 10.0.0.2/24
+Address = 10.0.0.2/24, fd00::2/64
 PrivateKey = $CLIENT_PRIVATE_KEY
-DNS = 8.8.8.8, 1.1.1.1
+DNS = 8.8.8.8, 1.1.1.1, 2001:4860:4860::8888
 
 [Peer]
 PublicKey = $SERVER_PUBLIC_KEY
 Endpoint = $PUBLIC_IP4:51820
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
 
@@ -75,6 +75,11 @@ sysctl -p /etc/sysctl.d/99-wireguard.conf
 echo ">>> 配置NAT..."
 iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
 iptables -A FORWARD -i wg0 -j ACCEPT
+
+# 配置IPv6 NAT
+echo ">>> 配置IPv6 NAT..."
+ip6tables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE 2>/dev/null || echo "警告: IPv6 NAT配置失败"
+ip6tables -A FORWARD -i wg0 -j ACCEPT 2>/dev/null || echo "警告: IPv6 FORWARD配置失败"
 
 # 启动WireGuard
 echo ">>> 启动WireGuard..."
