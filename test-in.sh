@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   版本：1.4"
+echo "   版本：1.4（解决openvpn失败问题）"
 echo "==========================================="
 
 # 0. 权限检查
@@ -79,20 +79,96 @@ install_required_packages() {
                 # 特殊处理oracular版本 (旧版本或不支持的版本)
                 echo "检测到Ubuntu oracular版本，正在使用备用安装方法..."
                 
+                # 安装必要的依赖包
+                echo "安装必要的依赖包..."
+                cd /tmp
+                
+                # 尝试安装lsb-release
+                if ! dpkg -l | grep -q lsb-release; then
+                    echo "安装lsb-release..."
+                    curl -s -L -o lsb-release.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/l/lsb/lsb-release_11.1.0ubuntu2_all.deb" 2>/dev/null
+                    dpkg -i lsb-release.deb 2>/dev/null || true
+                fi
+                
+                # 安装必要的OpenVPN依赖包
+                DEPS_PKGS="liblz4-1 liblzo2-2 libpkcs11-helper1 libssl1.1 libsystemd0 debconf"
+                for pkg in $DEPS_PKGS; do
+                    if ! dpkg -l | grep -q "$pkg"; then
+                        echo "安装依赖包: $pkg"
+                        curl -s -L -o "${pkg}.deb" "https://mirrors.edge.kernel.org/ubuntu/pool/main/${pkg:0:1}/${pkg%%-*}/${pkg}_*.deb" 2>/dev/null || true
+                        dpkg -i "${pkg}.deb" 2>/dev/null || true
+                    fi
+                done
+                
                 # 直接尝试下载和安装二进制包
                 if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
                     echo "尝试直接安装OpenVPN..."
-                    # 使用dpkg直接安装
-                    cd /tmp
-                    curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_2.5.0-1ubuntu1_amd64.deb" 2>/dev/null
-                    dpkg -i openvpn.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
-                    # 检查是否安装成功
-                    if command -v openvpn >/dev/null 2>&1; then
-                        OPENVPN_INSTALLED=1
-                        echo "OpenVPN 安装成功"
-                    else
-                        echo "警告: OpenVPN安装失败"
+                    
+                    # 尝试不同版本的OpenVPN
+                    OPENVPN_VERSIONS=("2.5.0-1ubuntu1" "2.4.7-1ubuntu2" "2.4.4-2ubuntu1")
+                    
+                    for version in "${OPENVPN_VERSIONS[@]}"; do
+                        echo "尝试安装OpenVPN版本: $version"
+                        curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_${version}_amd64.deb" 2>/dev/null
+                        
+                        if [ -f openvpn.deb ]; then
+                            # 使用dpkg直接安装
+                            dpkg -i openvpn.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
+                            
+                            # 检查是否安装成功
+                            if command -v openvpn >/dev/null 2>&1; then
+                                OPENVPN_INSTALLED=1
+                                echo "OpenVPN 版本 $version 安装成功"
+                                break
+                            fi
+                        fi
+                    done
+                    
+                    # 如果上述方法都失败，尝试使用源码编译
+                    if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
+                        echo "尝试使用源码编译安装OpenVPN..."
+                        
+                        # 安装编译工具
+                        apt-get install -y build-essential libssl-dev liblzo2-dev libpam0g-dev libpkcs11-helper1-dev 2>/dev/null || true
+                        
+                        # 下载和编译OpenVPN
+                        cd /tmp
+                        curl -s -L -o openvpn-2.4.7.tar.gz "https://swupdate.openvpn.org/community/releases/openvpn-2.4.7.tar.gz" 2>/dev/null
+                        tar -xzf openvpn-2.4.7.tar.gz 2>/dev/null
+                        cd openvpn-2.4.7 2>/dev/null
+                        ./configure 2>/dev/null && make 2>/dev/null && make install 2>/dev/null
+                        
+                        # 再次检查是否安装成功
+                        if command -v openvpn >/dev/null 2>&1; then
+                            OPENVPN_INSTALLED=1
+                            echo "OpenVPN 源码编译安装成功"
+                        else
+                            echo "警告: OpenVPN安装失败"
+                        fi
                     fi
+                fi
+                
+                # 确保OpenVPN服务目录存在
+                mkdir -p /etc/openvpn/client 2>/dev/null || true
+                mkdir -p /var/log/openvpn 2>/dev/null || true
+                
+                # 创建Systemd服务文件（如果不存在）
+                if [ ! -f /lib/systemd/system/openvpn@.service ] && [ -d /lib/systemd/system ]; then
+                    echo "创建OpenVPN systemd服务文件..."
+                    cat > /lib/systemd/system/openvpn@.service <<EOF
+[Unit]
+Description=OpenVPN connection to %i
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/openvpn --daemon --writepid /run/openvpn/%i.pid --cd /etc/openvpn -c %i.conf
+PIDFile=/run/openvpn/%i.pid
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
                 fi
                 
                 # 直接确保iptables已安装 (通常基本系统已安装)
