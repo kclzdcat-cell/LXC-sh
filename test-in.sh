@@ -4,6 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
+echo "   功版本：1.1"
 echo "==========================================="
 
 # 0. 权限检查
@@ -93,8 +94,18 @@ fi
 # 记录到文件，方便down脚本使用
 echo "$GW4 $DEV4" > /etc/openvpn/client/scripts/orig_gateway.txt
 
+# 添加到OpenVPN服务器的路由以确保VPN连接
+# 使用实际的VPN网关
+ip route add $4 via $GW4 dev $DEV4
+
 # 创建路由表
 ip route add default via $4 dev $1 table 200
+
+# 确保DNS服务器通过原始路由可访问
+ip rule add to 8.8.8.8/32 table main prio 95
+ip rule add to 1.1.1.1/32 table main prio 95
+# 添加ip.sb等IP查询服务通过原始网卡访问
+ip rule add to 108.61.196.101/32 table main prio 95  # ip.sb
 
 # 创建基于源IP的策略路由
 ip rule add from all to 224.0.0.0/4 table main prio 100
@@ -216,13 +227,21 @@ route-noexec
 up "/etc/openvpn/client/scripts/route-up.sh"
 down "/etc/openvpn/client/scripts/down.sh"
 
+# 设置最大连接重试次数和重试间隔
+resolv-retry infinite
+connect-retry 5 10
+
+# 使用强制ping确保连接存活
+ping 10
+ping-restart 60
+
 # DNS设置
 dhcp-option DNS 8.8.8.8
 dhcp-option DNS 1.1.1.1
 
-# 接受服务器推送的路由，但由我们的脚本决定如何使用
-# pull-filter accept "route"
-# pull-filter accept "route-ipv6"
+# 接受服务器推送的路由参数
+pull-filter accept "route"
+pull-filter accept "route-ipv6"
 
 # 屏蔽服务器的重定向网关指令，由我们自己控制
 pull-filter ignore "redirect-gateway"
@@ -282,15 +301,25 @@ if [[ -x /etc/openvpn/client/scripts/ipv6-setup.sh ]]; then
 fi
 
 # 8. 等待并验证
-echo ">>> 等待连接建立 (5秒)..."
-sleep 5
+echo ">>> 等待连接建立 (10秒)..."
+sleep 10
 
-echo "==========================================="
+echo "=========================================="
 echo "网络状态验证："
 echo "-------------------------------------------"
 echo "1. OpenVPN 服务状态："
 if systemctl is-active --quiet openvpn-client@client; then
     echo "   [OK] 服务运行中 (Active)"
+    echo "   >>> 连接日志 (最近5行)："
+    journalctl -u openvpn-client@client -n 5 --no-pager
+    
+    # 检查tun0接口是否创建成功
+    if ip addr show tun0 > /dev/null 2>&1; then
+        TUN0_IP=$(ip -4 addr show tun0 | grep -oP '(?<=inet ).*(?=/')
+        echo "   [OK] tun0接口已创建: IP=$TUN0_IP"
+    else
+        echo "   [ERROR] tun0接口未创建！"
+    fi
 else
     echo "   [ERROR] 服务未运行！"
     echo "   >>> 错误日志 (最后5行)："
@@ -298,7 +327,32 @@ else
 fi
 
 echo "-------------------------------------------"
-echo "2. IPv4 出口测试："
+echo "2. IPv4 连接测试："
+
+# 先测试原生网络连接
+echo "   原生网络测试（通过原始网卡）："
+ORIG_IP4=$(curl -4 -s --connect-timeout 5 --interface $(ip route show default | grep -v tun | head -n1 | awk '{print $5}') ip.sb || echo "获取失败")
+if [[ "$ORIG_IP4" != "获取失败" ]]; then
+    echo -e "      原始网络可用，外网IP: \033[32m$ORIG_IP4\033[0m"
+else
+    echo -e "      \033[31m原始网络连接失败\033[0m (请检查网络设置)"
+fi
+
+# 再测试VPN路由
+echo "   VPN路由测试（通过VPN隔离）："
+TUN_IP4=""
+if ip addr show tun0 > /dev/null 2>&1; then
+    TUN_IP4=$(curl -4 -s --connect-timeout 8 --interface tun0 ip.sb || echo "获取失败")
+    if [[ "$TUN_IP4" != "获取失败" ]]; then
+        echo -e "      VPN路由正常，外网IP: \033[32m$TUN_IP4\033[0m (应为出口服务器IP)"
+    else
+        echo -e "      \033[31mVPN路由连接失败\033[0m (可能是DNS解析问题)"
+    fi
+else
+    echo -e "      \033[31m未检测到tun0接口\033[0m"
+fi
+
+# 最后测试全局路由 (这应该显示出口服务器IP)
 IP4=$(curl -4 -s --connect-timeout 8 ip.sb || echo "获取失败")
 if [[ "$IP4" != "获取失败" ]]; then
     # 使用绿色显示 IP
