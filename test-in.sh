@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (IPv4+IPv6 智能路由版)"
 echo "   功能：保留SSH入口IP + 安全控制出站流量"
-echo "   版本：1.5（解决openvpn失败问题）"
+echo "   版本：1.6（解决openvpn失败问题）"
 echo "==========================================="
 
 # 0. 权限检查
@@ -114,7 +114,7 @@ install_required_packages() {
                 fi
                 
                 # 安装必要的OpenVPN依赖包
-                DEPS_PKGS="liblz4-1 liblzo2-2 libpkcs11-helper1 libssl1.1 libsystemd0 debconf"
+                DEPS_PKGS="liblz4-1 liblzo2-2 libpkcs11-helper1 libssl1.1 libsystemd0 debconf netfilter-persistent iptables-persistent"
                 for pkg in $DEPS_PKGS; do
                     if ! dpkg -l | grep -q "$pkg"; then
                         echo "安装依赖包: $pkg"
@@ -122,6 +122,36 @@ install_required_packages() {
                         dpkg -i "${pkg}.deb" 2>/dev/null || true
                     fi
                 done
+                
+                # 手动创建netfilter-persistent命令
+                if ! command -v netfilter-persistent >/dev/null 2>&1; then
+                    echo "创建netfilter-persistent命令..."
+                    cat > /usr/sbin/netfilter-persistent <<'EOF'
+#!/bin/bash
+case "$1" in
+  save)
+    iptables-save > /etc/iptables/rules.v4
+    if command -v ip6tables-save >/dev/null 2>&1; then
+      ip6tables-save > /etc/iptables/rules.v6
+    fi
+    echo "iptables rules saved"
+    ;;
+  reload)
+    iptables-restore < /etc/iptables/rules.v4
+    if command -v ip6tables-restore >/dev/null 2>&1 && [ -f /etc/iptables/rules.v6 ]; then
+      ip6tables-restore < /etc/iptables/rules.v6
+    fi
+    echo "iptables rules reloaded"
+    ;;
+  *)
+    echo "Usage: $0 {save|reload}"
+    exit 1
+    ;;
+esac
+EOF
+                    chmod +x /usr/sbin/netfilter-persistent
+                    mkdir -p /etc/iptables
+                fi
                 
                 # 直接尝试下载和安装二进制包
                 if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
@@ -354,38 +384,58 @@ if [ -f "/etc/openvpn/client/scripts/ssh_ports.conf" ]; then
     source "/etc/openvpn/client/scripts/ssh_ports.conf"
 fi
 
-# 记录原始默认路由
-GW4=$(ip route show default | grep -v tun | head -n1 | awk '{print $3}')
-DEV4=$(ip route show default | grep -v tun | head -n1 | awk '{print $5}')
+# 获取网卡信息
+DEV4=$(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1)
+GW4=$(ip -4 route | grep default | grep -v tun | awk '{print $3}' | head -n 1)
 
-if [[ -z "$GW4" || -z "$DEV4" ]]; then
-    echo "警告: 无法找到原始IPv4默认网关，路由可能不正确"
-fi
+# 清除旧的路由规则
+echo "清除旧的路由规则..."
+ip rule del to 8.8.8.8/32 table main prio 95 2>/dev/null || true
+ip rule del to 1.1.1.1/32 table main prio 95 2>/dev/null || true
+ip rule del to 108.61.196.101/32 table main prio 95 2>/dev/null || true
+ip rule del fwmark 22 table main prio 100 2>/dev/null || true
+ip rule del from all table 200 prio 200 2>/dev/null || true
 
-# 记录到文件，方便down脚本使用
-echo "$GW4 $DEV4" > /etc/openvpn/client/scripts/orig_gateway.txt
+# 清除路由表
+ip route flush table 200 2>/dev/null || true
 
-# 添加到OpenVPN服务器的路由以确保VPN连接
-# 使用实际的VPN网关
-ip route add $4 via $GW4 dev $DEV4
+# 确保有到VPN服务器的直接路由
+echo "添加到VPN服务器的直接路由: $4 via $GW4 dev $DEV4"
+ip route add $4 via $GW4 dev $DEV4 2>/dev/null || true
 
-# 创建路由表
-ip route add default via $4 dev $1 table 200
+# 添加到DNS服务器的路由
+echo "添加DNS服务器和IP查询服务的路由规则..."
+ip rule add to 8.8.8.8/32 table main prio 95 2>/dev/null || true
+ip rule add to 1.1.1.1/32 table main prio 95 2>/dev/null || true
+ip rule add to 108.61.196.101/32 table main prio 95 2>/dev/null || true
 
-# 确保DNS服务器通过原始路由可访问
-ip rule add to 8.8.8.8/32 table main prio 95
-ip rule add to 1.1.1.1/32 table main prio 95
-# 添加ip.sb等IP查询服务通过原始网卡访问
-ip rule add to 108.61.196.101/32 table main prio 95  # ip.sb
+# 标记的流量走原始网卡
+echo "添加标记流量的路由规则..."
+ip rule add fwmark 22 table main prio 100 2>/dev/null || true
 
-# 创建基于源IP的策略路由
-ip rule add from all to 224.0.0.0/4 table main prio 100
-ip rule add from all to 255.255.255.255 table main prio 100
+# 添加默认路由到表200
+echo "添加默认路由到表200: default via $5 dev $1"
+ip route add default via $5 dev $1 table 200 2>/dev/null || true
+
+# 添加策略路由规则
+echo "添加策略路由规则..."
+ip rule add from all table 200 prio 200 2>/dev/null || true
+
+# 清除路由缓存
+ip route flush cache
+
+# 显示当前路由表状态
+echo "当前路由表状态:"
+ip route show table 200
+echo "当前路由规则:"
+ip rule show
+ip rule add from all to 224.0.0.0/4 table main prio 100 2>/dev/null || true
+ip rule add from all to 255.255.255.255 table main prio 100 2>/dev/null || true
 
 # SSH流量标记配置
 
 # 创建规则来处理SSH流量
-ip rule add fwmark 22 table main prio 100
+# 注意: 这条规则已经在上面添加过了，这里不需要重复添加
 
 if [[ "$SSH_PORT_CHOICE" == "1" ]]; then
     # 选项1: 只标记标准22端口
@@ -436,9 +486,7 @@ elif [[ "$SSH_PORT_CHOICE" == "3" ]]; then
     iptables -t mangle -A INPUT -p tcp -m state --state NEW -j MARK --set-mark 22
 fi
 
-# 其他所有流量走VPN
-ip rule add from all table 200 prio 200
-
+# 注意: 这些规则已经在route-up.sh脚本中添加过了
 # 清除路由缓存
 ip route flush cache
 SCRIPT
@@ -641,6 +689,104 @@ fi
 # 8. 等待并验证
 echo ">>> 等待连接建立 (10秒)..."
 sleep 10
+
+echo ">>> 验证连接状态..."
+
+# 检查OpenVPN服务状态
+if systemctl is-active --quiet openvpn-client@client; then
+    echo "OpenVPN服务已成功启动"
+else
+    echo "错误: OpenVPN服务未启动或启动失败"
+    systemctl status openvpn-client@client
+    
+    # 尝试手动启动OpenVPN
+    echo "尝试手动启动OpenVPN..."
+    systemctl daemon-reload
+    systemctl restart openvpn-client@client
+    sleep 5
+    
+    # 再次检查状态
+    if ! systemctl is-active --quiet openvpn-client@client; then
+        echo "仍然无法启动OpenVPN，尝试手动运行..."
+        mkdir -p /run/openvpn
+        openvpn --config /etc/openvpn/client/client.conf --daemon
+        sleep 5
+    fi
+fi
+
+# 检查tun0接口
+if ip addr show tun0 > /dev/null 2>&1; then
+    echo "tun0接口已创建"
+    
+    # 确保路由表配置正确
+    echo "确保路由表配置正确..."
+    VPN_GW=$(ip -4 route | grep "dev tun0" | grep -v "via" | head -n 1 | awk '{print $1}')
+    if [ -n "$VPN_GW" ]; then
+        echo "添加默认路由到表200..."
+        ip route add default via $VPN_GW dev tun0 table 200 2>/dev/null || true
+        ip rule add from all table 200 prio 200 2>/dev/null || true
+        ip route flush cache
+    fi
+else
+    echo "错误: tun0接口未创建"
+    echo "尝试手动启动OpenVPN..."
+    openvpn --config /etc/openvpn/client/client.conf --daemon
+    sleep 5
+fi
+
+# 检查原始IP
+echo ">>> 检测原始IPv4..."
+ORIG_IP4=$(curl -4s --interface $(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1) https://ip.sb)
+echo "原始IPv4: $ORIG_IP4"
+
+# 检查出口IP
+echo ">>> 检测出口IPv4..."
+CURRENT_IP4=$(curl -4s https://ip.sb)
+echo "当前IPv4出口IP: $CURRENT_IP4"
+
+# 如果出口IP与原始IP相同，则路由可能有问题
+if [ "$CURRENT_IP4" = "$ORIG_IP4" ]; then
+    echo "警告: 出口IP与原始IP相同，尝试修复路由..."
+    
+    # 获取tun0网关
+    TUN_GW=$(ip -4 route | grep "dev tun0" | grep -v "via" | head -n 1 | awk '{print $1}')
+    if [ -n "$TUN_GW" ]; then
+        echo "重新配置路由表..."
+        ip route flush table 200
+        ip rule del table 200 2>/dev/null || true
+        ip rule add from all table 200 prio 200
+        ip route add default via $TUN_GW dev tun0 table 200
+        ip route flush cache
+        
+        # 再次检查出口IP
+        sleep 3
+        CURRENT_IP4=$(curl -4s https://ip.sb)
+        echo "重新配置后的出口IPv4: $CURRENT_IP4"
+    fi
+fi
+
+# 如果配置了IPv6，检查IPv6出口
+if [[ "$IPV6_CHOICE" == "1" || "$IPV6_CHOICE" == "2" ]]; then
+    echo ">>> 检测出口IPv6..."
+    CURRENT_IP6=$(curl -6s https://ip.sb)
+    echo "当前IPv6出口IP: $CURRENT_IP6"
+    
+    # 如果配置了IPv6但没有获取到IPv6地址，尝试修夏
+    if [ -z "$CURRENT_IP6" ]; then
+        echo "警告: 未检测到IPv6出口IP，尝试修夏..."
+        if [ -f /etc/openvpn/client/scripts/ipv6-setup.sh ]; then
+            echo "重新运行IPv6配置脚本..."
+            /etc/openvpn/client/scripts/ipv6-setup.sh "$IPV6_CHOICE"
+            sleep 3
+            CURRENT_IP6=$(curl -6s https://ip.sb)
+            echo "重新配置后的出口IPv6: $CURRENT_IP6"
+        fi
+    fi
+fi
+
+echo "=========================================="
+echo "安装完成！OpenVPN客户端已配置并运行。"
+echo "=========================================="
 
 echo "=========================================="
 echo "网络状态验证："
