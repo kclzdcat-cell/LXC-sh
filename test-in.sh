@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (简化版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：3.0 (nftables增强版)"
+echo "   版本：3.1 (SSH安全增强版)"
 echo "==========================================="
 
 # 0. 权限检查
@@ -312,6 +312,23 @@ if [ $USE_NFTABLES -eq 1 ]; then
     nft add chain inet vpn input { type filter hook input priority 0 \; }
     nft add chain inet vpn output { type filter hook output priority 0 \; }
     
+    # 首先保护SSH连接
+    echo "[路由配置] 保护SSH连接(nft)..."
+    # 获取当前SSH端口
+    SSH_PORT=22  # 默认SSH端口
+    if netstat -tnlp 2>/dev/null | grep -q sshd; then
+        SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | grep -oE '[0-9]+' | head -n 1)
+        echo "[路由配置] 检测到SSH端口: $SSH_PORT"
+    fi
+    
+    # 先添加SSH规则，确保SSH不会断开
+    nft add rule inet vpn input ip protocol tcp tcp dport $SSH_PORT counter accept
+    nft add rule inet vpn output ip protocol tcp tcp sport $SSH_PORT counter accept
+    
+    # 对所有SSH相关流量进行标记
+    nft add rule inet vpn input ip protocol tcp tcp dport $SSH_PORT counter meta mark set 22
+    nft add rule inet vpn output ip protocol tcp tcp sport $SSH_PORT counter meta mark set 22
+    
     # 标记所有TCP入站连接
     echo "[路由配置] 标记所有TCP入站连接(nft)..."
     nft add rule inet vpn input ip protocol tcp counter meta mark set 22
@@ -323,6 +340,23 @@ else
     iptables -t mangle -F 2>/dev/null || true
     ip6tables -t mangle -F 2>/dev/null || true
     
+    # 首先保护SSH连接
+    echo "[路由配置] 保护SSH连接(iptables)..."
+    # 获取当前SSH端口
+    SSH_PORT=22  # 默认SSH端口
+    if netstat -tnlp 2>/dev/null | grep -q sshd; then
+        SSH_PORT=$(netstat -tnlp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | grep -oE '[0-9]+' | head -n 1)
+        echo "[路由配置] 检测到SSH端口: $SSH_PORT"
+    fi
+    
+    # 先添加SSH规则，确保SSH不会断开
+    iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+    iptables -A OUTPUT -p tcp --sport $SSH_PORT -j ACCEPT
+    
+    # 对所有SSH相关流量进行标记
+    iptables -t mangle -A INPUT -p tcp --dport $SSH_PORT -j MARK --set-mark 22
+    iptables -t mangle -A OUTPUT -p tcp --sport $SSH_PORT -j MARK --set-mark 22
+    
     # 标记所有TCP入站连接
     echo "[路由配置] 标记所有TCP入站连接(iptables)..."
     iptables -t mangle -A INPUT -p tcp -j MARK --set-mark 22
@@ -330,6 +364,13 @@ else
     
     # 如果有IPv6，也标记IPv6流量
     if ip -6 addr show dev $DEV4 | grep -q 'inet6' 2>/dev/null; then
+        # 保护IPv6 SSH连接
+        ip6tables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || true
+        ip6tables -A OUTPUT -p tcp --sport $SSH_PORT -j ACCEPT 2>/dev/null || true
+        
+        # 标记IPv6流量
+        ip6tables -t mangle -A INPUT -p tcp --dport $SSH_PORT -j MARK --set-mark 22 2>/dev/null || true
+        ip6tables -t mangle -A OUTPUT -p tcp --sport $SSH_PORT -j MARK --set-mark 22 2>/dev/null || true
         ip6tables -t mangle -A INPUT -p tcp -j MARK --set-mark 22 2>/dev/null || true
         ip6tables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
     fi
