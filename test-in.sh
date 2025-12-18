@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (简化版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：2.0"
+echo "   版本：2.1"
 echo "==========================================="
 
 # 0. 权限检查
@@ -15,8 +15,105 @@ fi
 
 # 1. 安装必要软件
 echo ">>> 安装必要软件..."
-apt-get update -y || true
-apt-get install -y openvpn iptables curl || true
+
+# 检查软件是否已安装
+OPENVPN_INSTALLED=0
+IPTABLES_INSTALLED=0
+CURL_INSTALLED=0
+
+if command -v openvpn >/dev/null 2>&1; then
+    OPENVPN_INSTALLED=1
+    echo "OpenVPN 已安装"
+fi
+
+if command -v iptables >/dev/null 2>&1; then
+    IPTABLES_INSTALLED=1
+    echo "iptables 已安装"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    CURL_INSTALLED=1
+    echo "curl 已安装"
+fi
+
+# 先清除可能的锁文件
+rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
+rm -f /var/lib/dpkg/lock 2>/dev/null || true
+rm -f /var/cache/apt/archives/lock 2>/dev/null || true
+rm -f /var/lib/apt/lists/lock 2>/dev/null || true
+
+# 修复可能的dpkg问题
+dpkg --configure -a 2>/dev/null || true
+apt-get -f install -y 2>/dev/null || true
+
+# 尝试更新和安装软件
+echo ">>> 更新软件源..."
+apt-get update -y || echo "警告: apt update 失败，继续执行"
+
+if [[ $OPENVPN_INSTALLED -eq 0 ]]; then
+    echo ">>> 安装 OpenVPN..."
+    apt-get install -y openvpn || echo "警告: apt安装OpenVPN失败，尝试直接下载"
+    
+    # 再次检查是否安装成功
+    if ! command -v openvpn >/dev/null 2>&1; then
+        echo "尝试使用备用方法安装OpenVPN..."
+        
+        # 尝试下载预编译的包
+        cd /tmp
+        curl -s -L -o openvpn.deb "https://mirrors.edge.kernel.org/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null || \
+        curl -s -L -o openvpn.deb "http://archive.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null || \
+        curl -s -L -o openvpn.deb "http://security.ubuntu.com/ubuntu/pool/main/o/openvpn/openvpn_2.4.7-1ubuntu2_amd64.deb" 2>/dev/null
+        
+        if [ -f openvpn.deb ]; then
+            dpkg -i openvpn.deb 2>/dev/null || apt-get -f install -y 2>/dev/null
+        fi
+    fi
+    
+    # 再次检查是否安装成功
+    if ! command -v openvpn >/dev/null 2>&1; then
+        echo "错误: 无法安装OpenVPN，请手动安装后重试。"
+        exit 1
+    else
+        echo "OpenVPN 安装成功"
+        OPENVPN_INSTALLED=1
+    fi
+fi
+
+if [[ $IPTABLES_INSTALLED -eq 0 ]]; then
+    echo ">>> 安装 iptables..."
+    apt-get install -y iptables iptables-persistent || echo "警告: apt安装iptables失败"
+    
+    # 再次检查是否安装成功
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo "错误: 无法安装iptables，请手动安装后重试。"
+        exit 1
+    else
+        echo "iptables 安装成功"
+        IPTABLES_INSTALLED=1
+    fi
+fi
+
+if [[ $CURL_INSTALLED -eq 0 ]]; then
+    echo ">>> 安装 curl..."
+    apt-get install -y curl || echo "警告: apt安装curl失败"
+    
+    # 再次检查是否安装成功
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "错误: 无法安装curl，请手动安装后重试。"
+        exit 1
+    else
+        echo "curl 安装成功"
+        CURL_INSTALLED=1
+    fi
+fi
+
+# 确保所有必要软件已安装
+if [[ $OPENVPN_INSTALLED -eq 0 || $IPTABLES_INSTALLED -eq 0 || $CURL_INSTALLED -eq 0 ]]; then
+    echo "错误: 必要软件安装失败，请手动安装后重试。"
+    exit 1
+fi
+
+echo "所有必要软件已安装完成"
 
 # 2. 检查 client.ovpn
 if [ ! -f /root/client.ovpn ]; then
@@ -194,8 +291,42 @@ fi
 
 # 8. 重启OpenVPN服务
 echo ">>> 重启OpenVPN服务..."
+
+# 确保OpenVPN服务目录存在
+mkdir -p /etc/openvpn/client/scripts 2>/dev/null || true
+mkdir -p /var/log/openvpn 2>/dev/null || true
+mkdir -p /run/openvpn 2>/dev/null || true
+
+# 创建Systemd服务文件（如果不存在）
+if [ ! -f /lib/systemd/system/openvpn@.service ] && [ -d /lib/systemd/system ]; then
+    echo "创建OpenVPN systemd服务文件..."
+    cat > /lib/systemd/system/openvpn@.service <<EOF
+[Unit]
+Description=OpenVPN connection to %i
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/openvpn --daemon --writepid /run/openvpn/%i.pid --cd /etc/openvpn -c %i.conf
+PIDFile=/run/openvpn/%i.pid
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+# 重启服务
 systemctl daemon-reload
 systemctl restart openvpn-client@client
+
+# 检查服务是否启动成功
+sleep 3
+if ! systemctl is-active --quiet openvpn-client@client; then
+    echo "警告: OpenVPN服务启动失败，尝试手动启动..."
+    openvpn --config /etc/openvpn/client/client.conf --daemon
+    sleep 3
+fi
 
 # 9. 等待并验证
 echo ">>> 等待连接建立 (10秒)..."
@@ -220,8 +351,15 @@ fi
 # 检查tun0接口
 if ip addr show tun0 > /dev/null 2>&1; then
     echo "tun0接口已创建"
+    TUN_CREATED=1
 else
-    echo "错误: tun0接口未创建"
+    echo "错误: tun0接口未创建，脚本将不会修改路由表"
+    TUN_CREATED=0
+    
+    # 如果没有tun0接口，则不要修改路由表
+    echo "警告: 因为tun0接口未创建，脚本将不会修改路由表。"
+    echo "请手动检查OpenVPN配置并重试。"
+    exit 1
 fi
 
 # 检查原始IP
