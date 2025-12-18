@@ -67,11 +67,19 @@ echo "TCP端口 = $TCP_PORT"
 
 #----------- 启用 IPv4 / IPv6 转发 -----------
 
-echo 1 >/proc/sys/net/ipv4/ip_forward
-sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+# 检查/etc/sysctl.conf是否存在，不存在则创建
+if [ ! -f /etc/sysctl.conf ]; then
+    echo "创建缺失的/etc/sysctl.conf文件..."
+    touch /etc/sysctl.conf
+fi
 
-echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
-sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
+# 启用IP转发
+echo 1 >/proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "警告: 无法直接设置内核参数，将只修改配置文件"
+sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf 2>/dev/null || echo "警告: 无法修改sysctl.conf，可能需要手动设置IP转发"
+
+# 启用IPv6转发 (如果支持)
+echo 1 >/proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "注意: IPv6转发可能不支持，这是正常的"
+sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf 2>/dev/null || true
 
 #----------- 配置 NAT (IPv4) -----------
 iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o $NIC -j MASQUERADE
@@ -82,12 +90,14 @@ if [[ -n "$PUB_IP6" ]]; then
     if command -v ip6tables >/dev/null; then
         HAS_IPV6=1
         echo "检测到 IPv6，启用 IPv6 NAT..."
-        ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
+        ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE 2>/dev/null || echo "警告: IPv6 NAT设置失败，可能不支持IPv6 NAT"
     fi
 fi
 
-iptables-save >/etc/iptables/rules.v4
-ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+# 保存防火墙规则，出错不中断脚本
+mkdir -p /etc/iptables 2>/dev/null || true
+iptables-save >/etc/iptables/rules.v4 2>/dev/null || echo "警告: 无法保存IPv4防火墙规则"
+[[ $HAS_IPV6 -eq 1 ]] && ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
 
 #----------- server.conf（UDP）-----------
 cat >/etc/openvpn/server.conf <<EOF
@@ -206,26 +216,49 @@ EOF
 
 echo "client.ovpn 已生成：/root/client.ovpn"
 
-#----------- 上传到入口服务器 -----------
-echo "请输入入口服务器 SSH 信息："
-read -p "入口 IP：" IN_IP
-read -p "入口端口(默认22)：" IN_PORT
-IN_PORT=${IN_PORT:-22}
-read -p "入口 SSH 用户(默认root)：" IN_USER
-IN_USER=${IN_USER:-root}
-read -p "入口 SSH 密码：" IN_PASS
+#----------- 配置上传选项 -----------
+echo -e "\n请选择配置文件上传方式:"
+echo "1) 自动上传到入口服务器（需要SSH密码）"
+echo "2) 仅生成配置文件，手动上传（适用于无法直接连接的情况）"
+read -p "请选择 [1/2]: " UPLOAD_CHOICE
+UPLOAD_CHOICE=${UPLOAD_CHOICE:-1}
 
-echo ">>> 正在清理旧的主机指纹..."
-mkdir -p /root/.ssh
-touch /root/.ssh/known_hosts
-# 尝试删除纯 IP 记录
-ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
-# 尝试删除 [IP]:Port 格式的记录 (非标准端口常见)
-ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
+if [[ "$UPLOAD_CHOICE" == "1" ]]; then
+    #----------- 上传到入口服务器 -----------
+    echo "请输入入口服务器 SSH 信息："
+    read -p "入口 IP：" IN_IP
+    read -p "入口端口(默认22)：" IN_PORT
+    IN_PORT=${IN_PORT:-22}
+    read -p "入口 SSH 用户(默认root)：" IN_USER
+    IN_USER=${IN_USER:-root}
+    read -p "入口 SSH 密码：" IN_PASS
 
-echo ">>> 开始传输文件..."
-# 添加了 -o UserKnownHostsFile=/dev/null 作为双重保险，强制忽略指纹差异
-sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $CLIENT $IN_USER@$IN_IP:/root/
+    echo ">>> 正在清理旧的主机指纹..."
+    mkdir -p /root/.ssh
+    touch /root/.ssh/known_hosts
+    # 尝试删除纯 IP 记录
+    ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
+    # 尝试删除 [IP]:Port 格式的记录 (非标准端口常见)
+    ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
 
-echo "上传成功！出口服务器部署完成！"
-echo "==========================================="
+    echo ">>> 开始传输文件..."
+    # 添加了 -o UserKnownHostsFile=/dev/null 作为双重保险，强制忽略指纹差异
+    if sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $CLIENT $IN_USER@$IN_IP:/root/; then
+        echo "上传成功！出口服务器部署完成！"
+        echo "=========================================="
+    else
+        echo "警告: 文件上传失败。请使用以下方法手动传输文件:"
+        echo "1. 使用SCP: scp $CLIENT 用户名@入口服务器IP:/root/"
+        echo "2. 或直接下载文件: $CLIENT"
+        echo "=========================================="
+    fi
+else
+    echo "\n配置文件已生成但未上传。请手动传输以下文件到入口服务器的/root/目录:"
+    echo "   $CLIENT"
+    echo ""
+    echo "可用的传输命令示例:"
+    echo "   scp $CLIENT 用户名@入口服务器IP:/root/"
+    echo ""
+    echo "完成后，在入口服务器上运行入口脚本。"
+    echo "=========================================="
+fi="
