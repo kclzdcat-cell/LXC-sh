@@ -4,7 +4,7 @@ set -e
 echo "==========================================="
 echo "   OpenVPN 入口部署 (简化版)"
 echo "   功能：保留入口机IPv4/IPv6连接 + 出站走VPN"
-echo "   版本：2.1"
+echo "   版本：2.2"
 echo "==========================================="
 
 # 0. 权限检查
@@ -20,6 +20,7 @@ echo ">>> 安装必要软件..."
 OPENVPN_INSTALLED=0
 IPTABLES_INSTALLED=0
 CURL_INSTALLED=0
+HOST_INSTALLED=0
 
 if command -v openvpn >/dev/null 2>&1; then
     OPENVPN_INSTALLED=1
@@ -107,6 +108,26 @@ if [[ $CURL_INSTALLED -eq 0 ]]; then
     fi
 fi
 
+# 检查host命令是否安装
+if command -v host >/dev/null 2>&1; then
+    HOST_INSTALLED=1
+    echo "host命令已安装"
+fi
+
+# 如果host命令未安装，尝试安装bind9-host或dnsutils
+if [[ $HOST_INSTALLED -eq 0 ]]; then
+    echo ">>> 安装 host命令..."
+    apt-get install -y bind9-host dnsutils || echo "警告: 安装host命令失败"
+    
+    # 再次检查是否安装成功
+    if command -v host >/dev/null 2>&1; then
+        HOST_INSTALLED=1
+        echo "host命令安装成功"
+    else
+        echo "警告: 无法安装host命令，将跳过DNS解析测试"
+    fi
+fi
+
 # 确保所有必要软件已安装
 if [[ $OPENVPN_INSTALLED -eq 0 || $IPTABLES_INSTALLED -eq 0 || $CURL_INSTALLED -eq 0 ]]; then
     echo "错误: 必要软件安装失败，请手动安装后重试。"
@@ -137,40 +158,56 @@ cat > /etc/openvpn/client/scripts/route-up.sh <<'SCRIPT'
 DEV4=$(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1)
 GW4=$(ip -4 route | grep default | grep -v tun | awk '{print $3}' | head -n 1)
 
+echo "[路由配置] 原始网卡: $DEV4, 网关: $GW4"
+echo "[路由配置] VPN服务器IP: $4, VPN网关: $5, 设备: $1"
+
 # 清除旧的路由规则
+echo "[路由配置] 清除旧的路由规则..."
 ip rule del fwmark 22 table main prio 100 2>/dev/null || true
 ip rule del from all table 200 prio 200 2>/dev/null || true
 
-# 创建路由表200用于出站流量
-ip route flush table 200 2>/dev/null || true
-
-# 添加到VPN服务器的直接路由
+# 先添加到VPN服务器的直接路由
+echo "[路由配置] 添加到VPN服务器的直接路由: $4 via $GW4 dev $DEV4"
 ip route add $4 via $GW4 dev $DEV4
 
-# 添加默认路由到表200
-ip route add default via $5 dev $1 table 200
+# 标记的流量走原始网卡
+echo "[路由配置] 添加标记流量规则..."
+ip rule add fwmark 22 table main prio 100
 
 # 添加DNS服务器的路由
+echo "[路由配置] 添加DNS服务器路由..."
 ip rule add to 8.8.8.8/32 table main prio 95
 ip rule add to 1.1.1.1/32 table main prio 95
 
-# 标记的流量走原始网卡
-ip rule add fwmark 22 table main prio 100
+# 标记所有TCP入站连接
+echo "[路由配置] 标记所有TCP入站连接..."
+iptables -t mangle -F
+iptables -t mangle -A INPUT -p tcp -j MARK --set-mark 22
+iptables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22
+
+# 创建路由表200用于出站流量
+echo "[路由配置] 创建路由表200..."
+ip route flush table 200 2>/dev/null || true
+
+# 添加默认路由到表200
+echo "[路由配置] 添加默认路由到表200: default via $5 dev $1"
+ip route add default via $5 dev $1 table 200
 
 # 非标记流量走VPN
+echo "[路由配置] 添加非标记流量规则..."
 ip rule add from all table 200 prio 200
 
 # 清除路由缓存
+echo "[路由配置] 清除路由缓存..."
 ip route flush cache
 
-# 标记所有入站连接使用原始网卡
-iptables -t mangle -F
+# 显示路由规则
+echo "[路由配置] 当前路由规则:"
+ip rule show
 
-# 标记所有入站连接
-iptables -t mangle -A INPUT -j MARK --set-mark 22
-
-# 标记已建立的连接相关的出站流量
-iptables -t mangle -A OUTPUT -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22
+# 显示路由表
+echo "[路由配置] 路由表200:"
+ip route show table 200
 
 # IPv6配置
 if ip -6 addr show dev $DEV4 | grep -q 'inet6'; then
@@ -178,7 +215,7 @@ if ip -6 addr show dev $DEV4 | grep -q 'inet6'; then
     GW6=$(ip -6 route | grep default | grep -v tun | awk '{print $3}' | head -n 1)
     
     if [ -n "$GW6" ]; then
-        echo "IPv6网关: $GW6"
+        echo "[路由配置] IPv6网关: $GW6"
         
         # 清除旧的IPv6路由规则
         ip -6 rule del fwmark 22 table main prio 100 2>/dev/null || true
@@ -187,25 +224,32 @@ if ip -6 addr show dev $DEV4 | grep -q 'inet6'; then
         # 创建路由表200用于IPv6出站流量
         ip -6 route flush table 200 2>/dev/null || true
         
+        # 标记所有IPv6入站连接
+        ip6tables -t mangle -F 2>/dev/null || true
+        ip6tables -t mangle -A INPUT -p tcp -j MARK --set-mark 22 2>/dev/null || true
+        ip6tables -t mangle -A OUTPUT -p tcp -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22 2>/dev/null || true
+        
+        # 标记的IPv6流量走原始网卡
+        ip -6 rule add fwmark 22 table main prio 100 2>/dev/null || true
+        
         # 添加IPv6默认路由到表200
         if ip -6 addr show dev tun0 | grep -q 'inet6'; then
-            ip -6 route add default dev tun0 table 200
-            
-            # 标记的IPv6流量走原始网卡
-            ip -6 rule add fwmark 22 table main prio 100
+            echo "[路由配置] 添加IPv6默认路由到表200"
+            ip -6 route add default dev tun0 table 200 2>/dev/null || true
             
             # 非标记IPv6流量走VPN
-            ip -6 rule add from all table 200 prio 200
+            ip -6 rule add from all table 200 prio 200 2>/dev/null || true
             
             # 清除IPv6路由缓存
-            ip -6 route flush cache
-            
-            # 标记所有IPv6入站连接
-            ip6tables -t mangle -F
-            ip6tables -t mangle -A INPUT -j MARK --set-mark 22
-            ip6tables -t mangle -A OUTPUT -m state --state ESTABLISHED,RELATED -j MARK --set-mark 22
+            ip -6 route flush cache 2>/dev/null || true
+        else
+            echo "[路由配置] tun0接口没有IPv6地址，跳过IPv6路由配置"
         fi
+    else
+        echo "[路由配置] 未检测到IPv6网关，跳过IPv6路由配置"
     fi
+else
+    echo "[路由配置] 未检测到IPv6接口，跳过IPv6路由配置"
 fi
 SCRIPT
 
@@ -237,7 +281,16 @@ chmod +x /etc/openvpn/client/scripts/*.sh
 
 # 5. 修改OpenVPN配置
 echo ">>> 修改OpenVPN配置..."
-cat >> /etc/openvpn/client/client.conf <<'CONF'
+
+# 先备份原始client.conf
+cp /etc/openvpn/client/client.conf /etc/openvpn/client/client.conf.bak 2>/dev/null || true
+
+# 检查配置文件中是否已经包含我们的自定义配置
+if grep -q "script-security 2" /etc/openvpn/client/client.conf; then
+    echo "配置文件已包含自定义设置，跳过添加"
+else
+    # 添加我们的配置
+    cat >> /etc/openvpn/client/client.conf <<'CONF'
 
 # --- 智能路由控制 ---
 
@@ -261,7 +314,15 @@ dhcp-option DNS 1.1.1.1
 
 # 屏蔽服务器的重定向网关指令，由我们自己控制
 pull-filter ignore "redirect-gateway"
+
+# 确保接受服务器推送的路由
+pull-filter accept "route"
+pull-filter accept "route-ipv6"
+
+# 设置日志级别为详细
+verb 4
 CONF
+fi
 
 # 6. 配置系统参数
 echo ">>> 配置系统参数..."
@@ -357,29 +418,70 @@ else
     TUN_CREATED=0
     
     # 如果没有tun0接口，则不要修改路由表
-    echo "警告: 因为tun0接口未创建，脚本将不会修改路由表。"
-    echo "请手动检查OpenVPN配置并重试。"
-    exit 1
 fi
 
 # 检查原始IP
 echo ">>> 检测原始IPv4..."
-ORIG_IP4=$(curl -4s --interface $(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1) ip.sb)
+ORIG_DEV=$(ip -4 route | grep default | grep -v tun | awk '{print $5}' | head -n 1)
+echo "原始网卡: $ORIG_DEV"
+ORIG_IP4=$(curl -4s --interface $ORIG_DEV --connect-timeout 5 ip.sb || echo "无法获取")
 echo "原始IPv4: $ORIG_IP4"
 
-# 检查出口IP
-echo ">>> 检测出口IPv4..."
-CURRENT_IP4=$(curl -4s ip.sb)
+# 检查tun0接口IP
+echo ">>> 检测tun0接口IPv4..."
+if ip addr show tun0 > /dev/null 2>&1; then
+    TUN_IP4=$(curl -4s --interface tun0 --connect-timeout 5 ip.sb || echo "无法获取")
+    echo "tun0接口IPv4: $TUN_IP4"
+else
+    echo "tun0接口不存在"
+fi
+
+# 检查当前出口IP
+echo ">>> 检测当前出口IPv4..."
+CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
 echo "当前IPv4出口IP: $CURRENT_IP4"
+
+# 如果出口IP与原始IP相同，尝试修复路由
+if [ "$CURRENT_IP4" = "$ORIG_IP4" ] && [ "$CURRENT_IP4" != "无法获取" ]; then
+    echo ">>> 警告: 出口IP与原始IP相同，尝试修复路由..."
+    
+    # 获取tun0网关
+    TUN_GW=$(ip -4 route | grep "dev tun0" | grep -v "via" | head -n 1 | awk '{print $1}')
+    if [ -n "$TUN_GW" ]; then
+        echo "重新配置路由表..."
+        ip route flush table 200
+        ip rule del table 200 2>/dev/null || true
+        ip rule add from all table 200 prio 200
+        ip route add default via $TUN_GW dev tun0 table 200
+        ip route flush cache
+        
+        # 再次检查出口IP
+        sleep 3
+        CURRENT_IP4=$(curl -4s --connect-timeout 5 ip.sb || echo "无法获取")
+        echo "重新配置后的出口IPv4: $CURRENT_IP4"
+    fi
+fi
 
 # 检查IPv6出口
 echo ">>> 检测出口IPv6..."
-CURRENT_IP6=$(curl -6s ip.sb)
-if [ -n "$CURRENT_IP6" ]; then
+CURRENT_IP6=$(curl -6s --connect-timeout 5 ip.sb || echo "无法获取")
+if [ "$CURRENT_IP6" != "无法获取" ]; then
     echo "当前IPv6出口IP: $CURRENT_IP6"
 else
     echo "未检测到IPv6出口IP"
 fi
+
+# 检查DNS解析
+echo ">>> 检查DNS解析..."
+if [[ $HOST_INSTALLED -eq 1 ]]; then
+    host -t A google.com || echo "DNS解析失败"
+else
+    echo "host命令未安装，跳过DNS解析测试"
+fi
+
+# 测试连接性
+echo ">>> 测试连接性..."
+ping -c 3 8.8.8.8 || echo "ping 8.8.8.8 失败"
 
 echo "==========================================="
 echo "安装完成！OpenVPN客户端已配置并运行。"
