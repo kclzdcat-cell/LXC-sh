@@ -1,15 +1,15 @@
 #!/bin/bash
 
 echo "==========================================="
-echo "   WireGuard 出口部署 (修复版)"
+echo "   WireGuard 出口部署 (修复增强版)"
 echo "   功能：作为VPN出口服务器"
-echo "   版本：5.1"
+echo "   版本：5.2"
 echo "==========================================="
 
 # 安装WireGuard
 echo ">>> 安装WireGuard..."
 apt-get update
-apt-get install -y wireguard iptables curl
+apt-get install -y wireguard iptables curl sshpass
 
 # 获取公网IPv4
 echo ">>> 获取公网IPv4..."
@@ -24,7 +24,8 @@ echo "默认网卡: $DEFAULT_IFACE"
 echo ">>> 生成密钥..."
 umask 077
 mkdir -p /etc/wireguard
-cd /etc/wireguard
+cd /etc/wireguard || exit 1
+
 wg genkey > server_private.key
 wg pubkey < server_private.key > server_public.key
 wg genkey > client_private.key
@@ -34,9 +35,6 @@ SERVER_PRIVATE_KEY=$(cat server_private.key)
 SERVER_PUBLIC_KEY=$(cat server_public.key)
 CLIENT_PRIVATE_KEY=$(cat client_private.key)
 CLIENT_PUBLIC_KEY=$(cat client_public.key)
-
-echo "服务器公钥: $SERVER_PUBLIC_KEY"
-echo "客户端公钥: $CLIENT_PUBLIC_KEY"
 
 # 创建服务器配置
 echo ">>> 创建服务器配置..."
@@ -53,7 +51,8 @@ EOF
 
 # 创建客户端配置
 echo ">>> 创建客户端配置..."
-cat > /root/wg_client.conf <<EOF
+CLIENT_CONF="/root/wg_client.conf"
+cat > "$CLIENT_CONF" <<EOF
 [Interface]
 Address = 10.0.0.2/24, fd00::2/64
 PrivateKey = $CLIENT_PRIVATE_KEY
@@ -73,57 +72,59 @@ sysctl -p /etc/sysctl.d/99-wireguard.conf
 
 # 配置NAT
 echo ">>> 配置NAT..."
-iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
+iptables -t nat -A POSTROUTING -o "$DEFAULT_IFACE" -j MASQUERADE
 iptables -A FORWARD -i wg0 -j ACCEPT
 
-# 配置IPv6 NAT
+# IPv6
 echo ">>> 配置IPv6 NAT..."
-ip6tables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE 2>/dev/null || echo "警告: IPv6 NAT配置失败"
-ip6tables -A FORWARD -i wg0 -j ACCEPT 2>/dev/null || echo "警告: IPv6 FORWARD配置失败"
+ip6tables -t nat -A POSTROUTING -o "$DEFAULT_IFACE" -j MASQUERADE 2>/dev/null || true
+ip6tables -A FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
 
 # 启动WireGuard
 echo ">>> 启动WireGuard..."
 systemctl enable wg-quick@wg0
 systemctl restart wg-quick@wg0
 
-# 检查状态
-echo ">>> 检查状态..."
-systemctl status wg-quick@wg0 --no-pager
-wg show
-
 echo "==========================================="
-echo "安装完成！WireGuard服务器已配置并运行。"
-echo "客户端配置文件位于: /root/wg_client.conf"
-echo "请将此文件安全地传输到入口机。"
+echo "WireGuard 已启动"
+echo "客户端配置文件: $CLIENT_CONF"
 echo "==========================================="
 
-# 提供上传选项
-echo "是否要将客户端配置上传到入口机？(y/n)"
+# ========== 上传到入口服务器 ==========
+echo "是否要将客户端配置上传到入口服务器？(y/n)"
 read -r UPLOAD_CHOICE
 
-if [[ "$UPLOAD_CHOICE" == "y" || "$UPLOAD_CHOICE" == "Y" ]]; then
-    echo "请输入入口机的IP地址:"
-    read -r ENTRY_IP
-    
-    echo "请输入入口机的SSH端口 (默认: 22):"
-    read -r ENTRY_PORT
-    ENTRY_PORT=${ENTRY_PORT:-22}
-    
-    echo "请输入入口机的用户名 (默认: root):"
-    read -r ENTRY_USER
-    ENTRY_USER=${ENTRY_USER:-root}
+if [[ "$UPLOAD_CHOICE" =~ ^[Yy]$ ]]; then
+    echo "请输入入口服务器 SSH 信息："
+    read -p "入口 IP: " IN_IP
+    read -p "入口端口 (默认22): " IN_PORT
+    IN_PORT=${IN_PORT:-22}
+    read -p "入口 SSH 用户 (默认root): " IN_USER
+    IN_USER=${IN_USER:-root}
+    read -s -p "入口 SSH 密码: " IN_PASS
+    echo
 
-    echo "请输入入口机的ssh密码:"
-    read -r ENTER_PASSWORD
-    
-    echo "正在上传客户端配置到入口机..."
-    scp -P "$ENTRY_PORT" /root/wg_client.conf "$ENTRY_USER@$ENTRY_IP:/root/wg_client.conf"
-    
+    echo ">>> 清理旧的 SSH 主机指纹..."
+    mkdir -p /root/.ssh
+    touch /root/.ssh/known_hosts
+    ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
+    ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
+
+    echo ">>> 开始传输客户端配置..."
+    sshpass -p "$IN_PASS" scp \
+        -P "$IN_PORT" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        "$CLIENT_CONF" \
+        "$IN_USER@$IN_IP:/root/"
+
     if [ $? -eq 0 ]; then
-        echo "客户端配置已成功上传到入口机。"
+        echo "上传成功！入口服务器部署完成！"
     else
-        echo "上传失败，请手动传输配置文件。"
+        echo "上传失败，请检查SSH信息或网络。"
     fi
 else
-    echo "请手动将客户端配置文件传输到入口机。"
+    echo "已跳过上传，请手动传输客户端配置。"
 fi
+
+echo "==========================================="
