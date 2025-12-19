@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "2.0版本-支持ipv4/ipv6"
+
 # ================== 参数 ==================
 WG_IF="wg0"
 WG_TABLE="51820"
