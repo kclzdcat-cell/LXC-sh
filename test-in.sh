@@ -10,8 +10,10 @@ WG_MTU="1280"
 WG_ADDR4="10.66.66.2/32"
 WG_ADDR6="fd10::2/128"
 
-# ===== IPv6 出口控制 =====
-USE_V6_OUT="no"   # yes = IPv6 走出口机, no = IPv6 走本机
+# ================== IPv6 出口开关 ==================
+# no  = IPv6 走入口机本地（默认，最稳）
+# yes = IPv6 跟随 WireGuard 走出口机
+USE_V6_OUT="no"
 
 WG_DIR="/etc/wireguard"
 WG_CONF="${WG_DIR}/${WG_IF}.conf"
@@ -62,6 +64,8 @@ clean_old() {
   ip rule del fwmark ${WG_MARK} lookup main 2>/dev/null || true
   ip rule del lookup ${WG_TABLE} 2>/dev/null || true
   ip route flush table ${WG_TABLE} 2>/dev/null || true
+
+  # IPv6 表也清，但只有在开启过 IPv6 时才有内容
   ip -6 route flush table ${WG_TABLE} 2>/dev/null || true
 }
 
@@ -80,37 +84,43 @@ write_conf() {
   local server_port="$2"
   local server_pub="$3"
 
+  # ---------- AllowedIPs 按 IPv6 开关生成 ----------
   local allowed_ips="0.0.0.0/0"
   [[ "${USE_V6_OUT}" == "yes" ]] && allowed_ips="0.0.0.0/0, ::/0"
 
-  log "写入 wg0.conf（IPv6 出口：${USE_V6_OUT}）"
+  log "写入 wg0.conf（IPv6 出口 = ${USE_V6_OUT}）"
+
   cat >"${WG_CONF}" <<EOF
 [Interface]
 Address = ${WG_ADDR4}, ${WG_ADDR6}
 PrivateKey = $(cat "${WG_KEY}")
 Table = off
 
+# ★ MTU 必须在 WG 接管流量前生效 ★
 PostUp   = ip link set dev ${WG_IF} mtu ${WG_MTU}
 PostDown = ip link set dev ${WG_IF} mtu 1420 || true
 
-# 保护 SSH / 原连接
+# ================== 连接保护 ==================
+# 所有从原网卡进来的连接打标，防止 SSH 被拉进隧道
 PostUp   = iptables -t mangle -A PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
 PostUp   = iptables -t mangle -A OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
 
-# 出口机 endpoint 永远走原网卡
+# ================== Endpoint 保护 ==================
+# 出口机公网 IP 永远走 main 表，避免递归隧道
 PostUp   = ip rule add priority 50 to ${server_ip} lookup main
 
-# IPv4 policy routing
+# ================== IPv4 policy routing ==================
 PostUp   = ip route add default dev ${WG_IF} table ${WG_TABLE}
 PostUp   = ip rule add priority 100 fwmark ${WG_MARK} lookup main
 PostUp   = ip rule add priority 200 lookup ${WG_TABLE}
 
-# IPv6（可选）
+# ================== IPv6 policy routing（可选） ==================
 PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 route add default dev ${WG_IF} table ${WG_TABLE} || true
 PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 rule add priority 200 lookup ${WG_TABLE} || true
 
 PostUp   = ip route flush cache
 
+# ================== 清理 ==================
 PostDown = ip rule del priority 50 to ${server_ip} lookup main
 PostDown = ip rule del priority 100 fwmark ${WG_MARK} lookup main
 PostDown = ip rule del priority 200 lookup ${WG_TABLE}
@@ -130,14 +140,14 @@ EOF
 
 # ================== 启动 ==================
 start_wg() {
-  log "启动 WG"
+  log "启动 WG（MTU / policy routing 已准备好）"
   systemctl enable --now wg-quick@${WG_IF}
 }
 
 pause_for_peer() {
   echo
-  echo "====== 等待出口机对接 ======"
-  echo "出口机执行："
+  echo "================ 等待出口机对接 ================="
+  echo "请在【出口机】执行："
   echo "wg set wg0 peer $(cat ${WG_PUB}) allowed-ips 10.66.66.2/32,fd10::2/128"
   echo "wg-quick save wg0"
   echo
@@ -145,12 +155,14 @@ pause_for_peer() {
 }
 
 verify() {
-  log "验证出口"
-  echo "IPv4:"
-  curl -4 --max-time 10 api.ipify.org || true
+  log "最终验证"
+  wg show ${WG_IF}
   echo
-  echo "IPv6:"
-  curl -6 --max-time 10 api64.ipify.org || true
+  echo "IPv4 出口："
+  curl -4 --max-time 10 ip.sb || true
+  echo
+  echo "IPv6 出口："
+  curl -6 --max-time 10 ip.sb || true
 }
 
 # ================== 主流程 ==================
@@ -180,3 +192,6 @@ echo "========================="
 
 pause_for_peer
 verify
+
+echo
+echo "✅ 完成（IPv6 出口 = ${USE_V6_OUT}）"
