@@ -14,6 +14,21 @@ bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/rfw
 bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/memory.sh)
 ```
 
+## 🚀 OPENVPN一键执行命令
+# 出口部署
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/out.sh)
+```
+
+# 入口部署
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kclzdcat-cell/LXC-sh/main/in.sh)
+```
+
+## 🚀 WireGuard版一键执行命令
+
 # 出口部署
 
 ```bash
