@@ -1,167 +1,212 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WG_IF="wg0"
-WG_PORT="${WG_PORT:-51820}"
-WG_ADDR4="10.66.66.1/24"
-WG_ADDR6="fd10::1/64"
-WG_DIR="/etc/wireguard"
-WG_CONF="${WG_DIR}/${WG_IF}.conf"
-WG_KEY="${WG_DIR}/${WG_IF}.key"
-WG_PUB="${WG_DIR}/${WG_IF}.pub"
+# =========================================================
+# OpenVPN Egress Script (OUT)
+# Base   : WireGuard out.sh 等价迁移
+# Mode   : OpenVPN TCP + SSH 自动分发 client.ovpn
+# Version: 1.0
+# =========================================================
+
+SCRIPT_VERSION="1.0"
+
+echo "=================================================="
+echo " OpenVPN Egress Script v${SCRIPT_VERSION}"
+echo " 控制机 / 出口机"
+echo "=================================================="
+echo
+
+# ================== 参数 ==================
+OVPN_PORT="1194"
+OVPN_NET="10.8.0.0"
+OVPN_MASK="255.255.255.0"
+
+OVPN_DIR="/etc/openvpn"
+PKI_DIR="${OVPN_DIR}/pki"
+CLIENT_NAME="client1"
+CLIENT_OVPN="/root/client.ovpn"
 
 log(){ echo -e "\n[OUT] $*\n"; }
 
+# ================== 基础 ==================
 need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "请用 root 运行"; exit 1
-  fi
+  [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
 }
 
 wait_apt_locks() {
-  # 尽量避免 apt/dpkg 锁把你卡死
-  local locks=(
-    "/var/lib/dpkg/lock-frontend"
-    "/var/lib/dpkg/lock"
-    "/var/cache/apt/archives/lock"
-  )
   for i in {1..120}; do
-    local busy=0
-    for l in "${locks[@]}"; do
-      if fuser "$l" >/dev/null 2>&1; then busy=1; fi
-    done
-    [[ $busy -eq 0 ]] && return 0
+    fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break
     sleep 1
   done
-  echo "apt/dpkg 锁太久了，先手动处理：ps aux | grep -E 'apt|dpkg'"; exit 1
 }
 
 apt_fix_and_install() {
-  log "修复 dpkg/apt & 安装依赖"
+  log "安装 OpenVPN / easy-rsa / sshpass"
   systemctl stop unattended-upgrades 2>/dev/null || true
   wait_apt_locks
   dpkg --configure -a 2>/dev/null || true
   apt-get -y -f install 2>/dev/null || true
   wait_apt_locks
   apt-get update -y
-
-  # Debian/Ubuntu 通吃：wireguard-tools + iproute2 + iptables + curl
   apt-get install -y --no-install-recommends \
-    wireguard-tools iproute2 iptables curl ca-certificates
-
-  # 有些发行版有 wireguard 元包，装不上不算错
-  apt-get install -y --no-install-recommends wireguard 2>/dev/null || true
+    openvpn easy-rsa iproute2 iptables curl sshpass
 }
 
 detect_wan_if() {
-  ip route show default 0.0.0.0/0 | awk 'NR==1{print $5}'
+  ip route show default | awk 'NR==1{print $5}'
 }
 
-sysctl_forward() {
-  log "开启 IPv4/IPv6 转发"
+enable_forward() {
+  log "开启 IPv4 转发"
   mkdir -p /etc/sysctl.d
-  cat >/etc/sysctl.d/99-wg-forward.conf <<'EOF'
+  cat >/etc/sysctl.d/99-openvpn-forward.conf <<'EOF'
 net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
 EOF
   sysctl --system >/dev/null
 }
 
+# ================== 清理 ==================
 clean_old() {
-  log "清理旧 wg0（如果有）"
-  systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
-  wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
-  ip link del "${WG_IF}" >/dev/null 2>&1 || true
+  log "清理旧 OpenVPN"
+  systemctl disable --now openvpn@server 2>/dev/null || true
+  pkill openvpn 2>/dev/null || true
+  rm -rf "${OVPN_DIR}/server.conf" "${PKI_DIR}" "${CLIENT_OVPN}" 2>/dev/null || true
 }
 
-gen_keys() {
-  log "生成/重置密钥"
-  umask 077
-  mkdir -p "${WG_DIR}"
-  if [[ -f "${WG_KEY}" ]]; then
-    # 每次重装你都想“干净”，这里直接备份再重建
-    mv -f "${WG_KEY}" "${WG_KEY}.bak.$(date +%s)" || true
-  fi
-  if [[ -f "${WG_PUB}" ]]; then
-    mv -f "${WG_PUB}" "${WG_PUB}.bak.$(date +%s)" || true
-  fi
-  wg genkey | tee "${WG_KEY}" | wg pubkey > "${WG_PUB}"
-  chmod 600 "${WG_KEY}" "${WG_PUB}"
+# ================== PKI ==================
+init_pki() {
+  log "初始化 PKI"
+  make-cadir "${PKI_DIR}"
+  cd "${PKI_DIR}"
+  ./easyrsa init-pki
+  ./easyrsa --batch build-ca nopass
+  ./easyrsa --batch gen-dh
+  ./easyrsa --batch build-server-full server nopass
+  ./easyrsa --batch build-client-full "${CLIENT_NAME}" nopass
+  openvpn --genkey --secret ta.key
 }
 
-write_conf() {
-  local wan_if="$1"
-  log "写入 ${WG_CONF}"
-  cat >"${WG_CONF}" <<EOF
-[Interface]
-Address = ${WG_ADDR4}, ${WG_ADDR6}
-ListenPort = ${WG_PORT}
-PrivateKey = $(cat "${WG_KEY}")
+# ================== 配置 ==================
+write_server_conf() {
+  log "写入 server.conf"
+  cat >"${OVPN_DIR}/server.conf" <<EOF
+port ${OVPN_PORT}
+proto tcp-server
+dev tun
 
-# NAT：让入口机的出站最终显示“出口机公网IP”
-PostUp   = iptables -t nat -C POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+server ${OVPN_NET} ${OVPN_MASK}
 
-# IPv6 NAT（如果你出口机有 v6 且内核允许 nat 表）
-PostUp   = ip6tables -t nat -C POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
-PostDown = ip6tables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+ca ${PKI_DIR}/ca.crt
+cert ${PKI_DIR}/issued/server.crt
+key ${PKI_DIR}/private/server.key
+dh ${PKI_DIR}/dh.pem
+tls-auth ${PKI_DIR}/ta.key 0
+
+topology subnet
+keepalive 10 60
+persist-key
+persist-tun
+
+# 关键：不推任何默认路由
+push "route-nopull"
+
+verb 3
 EOF
-  chmod 600 "${WG_CONF}"
 }
 
-start_wg() {
-  log "启动 WireGuard"
-  systemctl enable --now "wg-quick@${WG_IF}" >/dev/null
-  sleep 1
-}
-
-get_pub_ip() {
-  # 多个源兜底，避免你遇到的 ip.sb 403
-  local ip4 ip6
-  ip4="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-  [[ -z "${ip4}" ]] && ip4="$(curl -4 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
-  ip6="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
-  [[ -z "${ip6}" ]] && ip6="$(curl -6 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
-  echo "${ip4}|${ip6}"
-}
-
-print_info() {
+setup_nat() {
   local wan_if="$1"
-  local ips server_pub
-  ips="$(get_pub_ip)"
-  local ip4="${ips%%|*}"
-  local ip6="${ips#*|}"
-  server_pub="$(cat "${WG_PUB}")"
-
-  log "给入口机填这三项（手动填，最稳）"
-  echo "出口机公网 IPv4: ${ip4:-（获取失败，手动填）}"
-  echo "出口机公网 IPv6: ${ip6:-（可空）}"
-  echo "WireGuard 端口  : ${WG_PORT}"
-  echo "出口机 Server 公钥: ${server_pub}"
-  echo
-  echo "出口机当前状态："
-  wg show "${WG_IF}" || true
-  echo
-  echo "下一步：去入口机跑 in.sh，它会给你一个 CLIENT 公钥。"
-  echo "然后回到出口机执行："
-  echo "  wg set ${WG_IF} peer <CLIENT_PUB> allowed-ips 10.66.66.2/32,fd10::2/128"
-  echo "  wg-quick save ${WG_IF}"
-  echo
-  echo "（可选）如果你想确认 NAT 出口是否正常：入口机连上后，入口机 curl -4 api.ipify.org 应该显示这里的出口 IPv4。"
+  log "配置 NAT（出口显示为出口机 IP）"
+  iptables -t nat -C POSTROUTING -s ${OVPN_NET}/24 -o "${wan_if}" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -s ${OVPN_NET}/24 -o "${wan_if}" -j MASQUERADE
 }
 
-main(){
-  need_root
-  apt_fix_and_install
-  sysctl_forward
-  clean_old
-  gen_keys
-  local wan_if
-  wan_if="$(detect_wan_if)"
-  [[ -z "${wan_if}" ]] && { echo "找不到默认外网网卡"; exit 1; }
-  write_conf "${wan_if}"
-  start_wg
-  print_info "${wan_if}"
+# ================== client.ovpn ==================
+build_client_ovpn() {
+  log "生成完整 client.ovpn（内嵌证书）"
+  local server_ip
+  server_ip="$(curl -4 -fsS ipinfo.io/ip)"
+
+  cat >"${CLIENT_OVPN}" <<EOF
+client
+dev tun
+proto tcp-client
+remote ${server_ip} ${OVPN_PORT}
+
+nobind
+persist-key
+persist-tun
+route-nopull
+verb 3
+
+<ca>
+$(cat ${PKI_DIR}/ca.crt)
+</ca>
+
+<cert>
+$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' ${PKI_DIR}/issued/${CLIENT_NAME}.crt)
+</cert>
+
+<key>
+$(cat ${PKI_DIR}/private/${CLIENT_NAME}.key)
+</key>
+
+<tls-auth>
+$(cat ${PKI_DIR}/ta.key)
+</tls-auth>
+key-direction 1
+EOF
 }
 
-main "$@"
+# ================== SSH 传输（按你示范） ==================
+ssh_transfer() {
+  echo
+  echo "=========== 上传到入口服务器 ==========="
+  read -p "入口 IP：" IN_IP
+  read -p "入口端口(默认22)：" IN_PORT
+  IN_PORT=${IN_PORT:-22}
+  read -p "入口 SSH 用户(默认root)：" IN_USER
+  IN_USER=${IN_USER:-root}
+  read -p "入口 SSH 密码：" IN_PASS
+
+  log "清理旧的主机指纹"
+  mkdir -p /root/.ssh
+  touch /root/.ssh/known_hosts
+  ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
+  ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
+
+  log "开始传输 client.ovpn"
+  sshpass -p "$IN_PASS" scp -P $IN_PORT \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    "${CLIENT_OVPN}" \
+    "${IN_USER}@${IN_IP}:/root/client.ovpn"
+
+  log "client.ovpn 已成功上传到入口机"
+}
+
+# ================== 启动 ==================
+start_openvpn() {
+  log "启动 OpenVPN Server"
+  systemctl enable --now openvpn@server
+}
+
+# ================== 主流程 ==================
+need_root
+apt_fix_and_install
+enable_forward
+clean_old
+
+WAN_IF="$(detect_wan_if)"
+init_pki
+write_server_conf
+setup_nat "${WAN_IF}"
+build_client_ovpn
+start_openvpn
+ssh_transfer
+
+echo
+echo "✅ 出口机完成："
+echo "- OpenVPN TCP 已启动"
+echo "- client.ovpn 已推送到入口机 /root/client.ovpn"
+echo "- 下一步：到入口机执行 in-openvpn.sh"
