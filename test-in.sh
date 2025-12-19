@@ -1,95 +1,223 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =====================================================
-# OpenVPN Ingress v2.4 (SSH-SAFE FINAL)
-# 核心原则：
-# - OpenVPN 绝不改默认路由
-# - 不使用 redirect-gateway
-# - route-nopull + 策略路由
-# - connmark 保护 SSH 生命周期
-# =====================================================
+# =========================================================
+# WireGuard Ingress Script
+# Base   : 原始稳定版 in.sh
+# Mode   : 方案 A（最小增强，永不断网）
+# Version: 1.2-bugfix
+# =========================================================
 
-VPN_IF="tun0"
-VPN_MARK="0x1"
-VPN_TABLE="100"
+SCRIPT_VERSION="1.2-bugfix"
 
-echo "========================================="
-echo " OpenVPN 入口部署 v2.4"
-echo " SSH 永不断 | 不改默认路由 | IPv4 出站走 VPN"
-echo "========================================="
+echo "=================================================="
+echo " WireGuard Ingress Script v${SCRIPT_VERSION}"
+echo " 基线稳定版 + Bugfix（不改架构）"
+echo "=================================================="
+echo
 
-[[ $EUID -eq 0 ]] || { echo "❌ 需要 root"; exit 1; }
-[[ -f /root/client.ovpn ]] || { echo "❌ /root/client.ovpn 不存在"; exit 1; }
+# ================== 参数 ==================
+WG_IF="wg0"
+WG_TABLE="51820"
+WG_MARK="0x1"
+WG_MTU="1280"   # ← 保持你实测最稳的值
 
-# ---------- 依赖 ----------
-apt update -y
-apt install -y openvpn iproute2 iptables iptables-persistent conntrack curl
+WG_ADDR4="10.66.66.2/32"
+WG_ADDR6="fd10::2/128"
 
-# ---------- 清理 ----------
-iptables -t mangle -F || true
-ip rule del fwmark ${VPN_MARK} lookup main 2>/dev/null || true
-ip rule del lookup ${VPN_TABLE} 2>/dev/null || true
-ip route flush table ${VPN_TABLE} 2>/dev/null || true
+WG_DIR="/etc/wireguard"
+WG_CONF="${WG_DIR}/${WG_IF}.conf"
+WG_KEY="${WG_DIR}/${WG_IF}.key"
+WG_PUB="${WG_DIR}/${WG_IF}.pub"
 
-# ---------- OpenVPN Client ----------
-mkdir -p /etc/openvpn/client
-cp /root/client.ovpn /etc/openvpn/client/client.conf
+log(){ echo -e "\n[IN] $*\n"; }
 
-# ★★ 核心：彻底禁止 OpenVPN 接管路由 ★★
-sed -i '/redirect-gateway/d' /etc/openvpn/client/client.conf
-sed -i '/route-ipv6/d' /etc/openvpn/client/client.conf
-
-grep -q "route-nopull" /etc/openvpn/client/client.conf || cat >> /etc/openvpn/client/client.conf <<'EOF'
-
-# ===== SSH SAFE MODE =====
-route-nopull
-pull-filter ignore redirect-gateway
-pull-filter ignore route-ipv6
-pull-filter ignore ifconfig-ipv6
-EOF
-
-# ---------- SSH connmark（仅基于端口） ----------
-iptables -t mangle -A PREROUTING \
-  -p tcp --dport 22 \
-  -m conntrack --ctstate NEW \
-  -j CONNMARK --set-mark ${VPN_MARK}
-
-iptables -t mangle -A PREROUTING \
-  -m connmark --mark ${VPN_MARK} \
-  -j MARK --set-mark ${VPN_MARK}
-
-ip rule add priority 100 fwmark ${VPN_MARK} lookup main
-
-# ---------- 启动 OpenVPN ----------
-systemctl enable openvpn-client@client
-systemctl restart openvpn-client@client
-
-echo "[IN] 等待 tun0（最多 20 秒）..."
-for i in {1..20}; do
-  ip link show ${VPN_IF} >/dev/null 2>&1 && break
-  sleep 1
-done
-
-ip link show ${VPN_IF} >/dev/null 2>&1 || {
-  echo "❌ tun0 未出现，未动路由，SSH 安全"
-  exit 1
+# ================== 基础 ==================
+need_root() {
+  [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
 }
 
-# ---------- 策略路由 ----------
-ip route add default dev ${VPN_IF} table ${VPN_TABLE}
-ip rule add priority 200 lookup ${VPN_TABLE}
+wait_apt_locks() {
+  for i in {1..120}; do
+    fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break
+    sleep 1
+  done
+}
 
-iptables-save >/etc/iptables/rules.v4
+apt_fix_and_install() {
+  log "安装依赖"
+  systemctl stop unattended-upgrades 2>/dev/null || true
+  wait_apt_locks
+  dpkg --configure -a 2>/dev/null || true
+  apt-get -y -f install 2>/dev/null || true
+  wait_apt_locks
+  apt-get update -y
+  apt-get install -y --no-install-recommends \
+    wireguard-tools iproute2 iptables ethtool curl ca-certificates
+}
 
-# ---------- 验证 ----------
-echo
-echo "IPv4 出口（应为出口机）："
-curl -4 --max-time 6 ip.sb || true
-echo
-echo "IPv6（应为入口本地）："
-curl -6 --max-time 6 ip.sb || true
+detect_main() {
+  local line gw ifc
+  line="$(ip route show default | head -n1)"
+  gw="$(awk '{print $3}' <<<"$line")"
+  ifc="$(awk '{print $5}' <<<"$line")"
+  echo "${gw}|${ifc}"
+}
+
+# ================== 清理 ==================
+clean_old() {
+  log "清理旧 WG（不动默认路由）"
+  systemctl disable --now wg-quick@${WG_IF} 2>/dev/null || true
+  wg-quick down ${WG_IF} 2>/dev/null || true
+  ip link del ${WG_IF} 2>/dev/null || true
+
+  ip rule del fwmark ${WG_MARK} lookup main 2>/dev/null || true
+  ip rule del lookup ${WG_TABLE} 2>/dev/null || true
+  ip route flush table ${WG_TABLE} 2>/dev/null || true
+  ip -6 route flush table ${WG_TABLE} 2>/dev/null || true
+}
+
+# ================== Key ==================
+gen_keys() {
+  log "生成入口机密钥"
+  umask 077
+  mkdir -p "${WG_DIR}"
+  wg genkey | tee "${WG_KEY}" | wg pubkey > "${WG_PUB}"
+  chmod 600 "${WG_KEY}" "${WG_PUB}"
+}
+
+# ================== IPv6 选择 ==================
+select_ipv6_mode() {
+  echo
+  echo "是否让 IPv6 也走出口机？"
+  echo "  1) 否（默认，IPv6 走入口机本地，最稳）"
+  echo "  2) 是（IPv4 + IPv6 都走出口机）"
+  echo
+  read -r -p "请选择 [1/2]（默认 1）: " choice
+
+  case "${choice:-1}" in
+    2) USE_V6_OUT="yes" ;;
+    *) USE_V6_OUT="no" ;;
+  esac
+
+  log "IPv6 出口模式：${USE_V6_OUT}"
+}
+
+# ================== 配置 ==================
+write_conf() {
+  local server_ip="$1"
+  local server_port="$2"
+  local server_pub="$3"
+
+  local allowed_ips="0.0.0.0/0"
+  [[ "${USE_V6_OUT}" == "yes" ]] && allowed_ips="0.0.0.0/0, ::/0"
+
+  log "写入 wg0.conf（保留原逻辑 + 性能 Bugfix）"
+
+  cat >"${WG_CONF}" <<EOF
+[Interface]
+Address = ${WG_ADDR4}, ${WG_ADDR6}
+PrivateKey = $(cat "${WG_KEY}")
+Table = off
+
+# ---------- MTU（保持 1280） ----------
+PostUp   = ip link set dev ${WG_IF} mtu ${WG_MTU}
+PostDown = ip link set dev ${WG_IF} mtu 1420 || true
+
+# ---------- SSH / 入站保护（原样保留） ----------
+PostUp   = iptables -t mangle -A PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
+PostUp   = iptables -t mangle -A OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
+
+# ---------- <<< BUGFIX 1：关闭 wg0 offload（关键） ----------
+PostUp   = ethtool -K ${WG_IF} gro off gso off tso off || true
+
+# ---------- <<< BUGFIX 2：TCP MSS Clamp（本机出站） ----------
+PostUp   = iptables -t mangle -A OUTPUT  -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -t mangle -D OUTPUT  -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+
+# ---------- <<< BUGFIX 3：TCP MSS Clamp（转发流量，原来就有但保留） ----------
+PostUp   = iptables -t mangle -A FORWARD -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -t mangle -D FORWARD -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+
+# ---------- 防套娃 ----------
+PostUp   = ip rule add priority 50 to ${server_ip} lookup main
+PostDown = ip rule del priority 50 to ${server_ip} lookup main || true
+
+# ---------- 策略路由（原样） ----------
+PostUp   = ip route add default dev ${WG_IF} table ${WG_TABLE}
+PostUp   = ip rule add priority 100 fwmark ${WG_MARK} lookup main
+PostUp   = ip rule add priority 200 lookup ${WG_TABLE}
+PostUp   = ip route flush cache
+
+PostDown = ip rule del priority 100 fwmark ${WG_MARK} lookup main || true
+PostDown = ip rule del priority 200 lookup ${WG_TABLE} || true
+PostDown = ip route flush table ${WG_TABLE}
+
+# ---------- IPv6（原逻辑保留） ----------
+PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 route add default dev ${WG_IF} table ${WG_TABLE} || true
+PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 rule add priority 200 lookup ${WG_TABLE} || true
+PostDown = ip -6 route flush table ${WG_TABLE} || true
+
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = ${server_ip}:${server_port}
+AllowedIPs = ${allowed_ips}
+PersistentKeepalive = 25
+EOF
+}
+
+# ================== 启动 ==================
+start_wg() {
+  log "启动 WG"
+  systemctl enable --now wg-quick@${WG_IF}
+}
+
+# ================== 后续流程保持原样 ==================
+pause_for_peer() {
+  echo
+  echo "================ 等待出口机对接 ================="
+  echo "请在【出口机】执行："
+  echo "  wg set wg0 peer $(cat ${WG_PUB}) allowed-ips 10.66.66.2/32,fd10::2/128"
+  echo "  wg-quick save wg0"
+  echo
+  read -r -p "出口机完成后，回到这里按 Enter 继续..." _
+}
+
+verify() {
+  log "最终出口验证"
+  echo "IPv4 出口："
+  curl -4 --max-time 10 ipinfo.io || true
+}
+
+# ================== 主流程 ==================
+need_root
+select_ipv6_mode
+apt_fix_and_install
+
+main_info="$(detect_main)"
+MAIN_GW="${main_info%%|*}"
+MAIN_IF="${main_info#*|}"
+
+log "入口机原始出口：${MAIN_IF} via ${MAIN_GW}"
+
+read -r -p "出口机公网 IP： " SERVER_IP
+read -r -p "WireGuard 端口（默认 51820）： " SERVER_PORT
+SERVER_PORT="${SERVER_PORT:-51820}"
+read -r -p "出口机 Server 公钥： " SERVER_PUB
+
+clean_old
+gen_keys
+write_conf "${SERVER_IP}" "${SERVER_PORT}" "${SERVER_PUB}"
+start_wg
 
 echo
-echo "✅ 完成：v2.4"
-echo "SSH 永不断 | 默认路由未改"
+echo "====== CLIENT 公钥（复制到出口机） ======"
+cat "${WG_PUB}"
+echo "=========================================="
+
+pause_for_peer
+verify
+
+echo
+echo "✅ 完成（Bugfix 版，不改架构）"
+echo "紧急回滚：wg-quick down ${WG_IF}"
