@@ -3,152 +3,118 @@ set -euo pipefail
 
 WG_IF="wg0"
 WG_PORT_DEFAULT="51820"
-WG_NET4="10.66.66.0/24"
-WG_SRV4="10.66.66.1/24"
-WG_CLI4="10.66.66.2/32"
-WG_NET6="fd10::/64"
-WG_SRV6="fd10::1/64"
-WG_CLI6="fd10::2/128"
+WG_V4_NET="10.66.66.0/24"
+WG_V4_SRV="10.66.66.1/24"
+WG_V6_NET="fd10::/64"
+WG_V6_SRV="fd10::1/64"
 
-need_root() { [ "$(id -u)" -eq 0 ] || { echo "请用 root 运行"; exit 1; }; }
-
-wait_apt() {
-  local i=0
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
-    i=$((i+1))
-    [ $i -gt 120 ] && { echo "dpkg/apt 锁超过 120 秒仍占用，先执行：ps -ef | grep apt"; exit 1; }
-    sleep 1
-  done
-}
-
-detect_wan_if() {
-  local if4
-  if4="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}' || true)"
-  if [ -n "$if4" ]; then echo "$if4"; return; fi
-  ip -6 route show default 2>/dev/null | awk '{print $5; exit}'
-}
-
-sysctl_on() {
-  cat >/etc/sysctl.d/99-wg-forward.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-  sysctl --system >/dev/null
-}
-
-install_pkgs() {
-  wait_apt
+need_root() { [[ ${EUID:-0} -eq 0 ]] || { echo "请用 root 执行"; exit 1; }; }
+os_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y --no-install-recommends \
     wireguard wireguard-tools iproute2 iptables nftables curl ca-certificates
 }
+get_wan_if() {
+  ip -4 route show default 2>/dev/null | awk '{print $5; exit}'
+}
+get_pub_ip4() { curl -4 -s --max-time 5 https://ip.sb || true; }
+get_pub_ip6() { curl -6 -s --max-time 5 https://ip.sb || true; }
 
-gen_keys() {
+cleanup_old() {
+  systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
+  ip link del "${WG_IF}" >/dev/null 2>&1 || true
+  rm -f "/etc/wireguard/${WG_IF}.conf"
+}
+
+enable_forwarding() {
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
+  cat >/etc/sysctl.d/99-wg-forward.conf <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+}
+
+make_keys() {
   umask 077
   mkdir -p /etc/wireguard
-  chmod 700 /etc/wireguard
-
-  wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
-  wg genkey | tee /etc/wireguard/client.key | wg pubkey > /etc/wireguard/client.pub
-  wg genpsk > /etc/wireguard/psk
-
-  SERVER_PRIV="$(cat /etc/wireguard/server.key)"
-  SERVER_PUB="$(cat /etc/wireguard/server.pub)"
-  CLIENT_PRIV="$(cat /etc/wireguard/client.key)"
-  CLIENT_PUB="$(cat /etc/wireguard/client.pub)"
-  PSK="$(cat /etc/wireguard/psk)"
+  if [[ ! -f /etc/wireguard/server.key ]]; then
+    wg genkey | tee /etc/wireguard/server.key >/dev/null
+  fi
+  wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
 }
 
-write_server_conf() {
+write_conf() {
   local wan_if="$1"
   local port="$2"
-  cat >/etc/wireguard/${WG_IF}.conf <<EOF
+  local srv_priv srv_pub
+  srv_priv="$(cat /etc/wireguard/server.key)"
+  srv_pub="$(cat /etc/wireguard/server.pub)"
+
+  cat >"/etc/wireguard/${WG_IF}.conf" <<EOF
 [Interface]
-Address = ${WG_SRV4}, ${WG_SRV6}
+Address = ${WG_V4_SRV}, ${WG_V6_SRV}
 ListenPort = ${port}
-PrivateKey = ${SERVER_PRIV}
+PrivateKey = ${srv_priv}
 
-# NAT + 转发（IPv4 + IPv6）
-PostUp = iptables -w -A INPUT -p udp --dport ${port} -j ACCEPT; iptables -w -A FORWARD -i ${WG_IF} -j ACCEPT; iptables -w -A FORWARD -o ${WG_IF} -j ACCEPT; iptables -w -t nat -A POSTROUTING -s ${WG_NET4} -o ${wan_if} -j MASQUERADE; ip6tables -w -A FORWARD -i ${WG_IF} -j ACCEPT; ip6tables -w -A FORWARD -o ${WG_IF} -j ACCEPT; ip6tables -w -t nat -A POSTROUTING -s ${WG_NET6} -o ${wan_if} -j MASQUERADE
-PostDown = iptables -w -D INPUT -p udp --dport ${port} -j ACCEPT; iptables -w -D FORWARD -i ${WG_IF} -j ACCEPT; iptables -w -D FORWARD -o ${WG_IF} -j ACCEPT; iptables -w -t nat -D POSTROUTING -s ${WG_NET4} -o ${wan_if} -j MASQUERADE; ip6tables -w -D FORWARD -i ${WG_IF} -j ACCEPT; ip6tables -w -D FORWARD -o ${WG_IF} -j ACCEPT; ip6tables -w -t nat -D POSTROUTING -s ${WG_NET6} -o ${wan_if} -j MASQUERADE
+# NAT + Forward (IPv4)
+PostUp = iptables -t nat -C POSTROUTING -s ${WG_V4_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_V4_NET} -o ${wan_if} -j MASQUERADE
+PostUp = iptables -C FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT
+PostUp = iptables -C FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-[Peer]
-PublicKey = ${CLIENT_PUB}
-PresharedKey = ${PSK}
-AllowedIPs = ${WG_CLI4}, ${WG_CLI6}
+PostDown = iptables -t nat -D POSTROUTING -s ${WG_V4_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+# NAT66 + Forward (IPv6) - 若内核/iptables 不支持 NAT66，此段可能无效，但不影响 IPv4
+PostUp = ip6tables -t nat -C POSTROUTING -s ${WG_V6_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -s ${WG_V6_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+PostUp = ip6tables -C FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || true
+PostUp = ip6tables -C FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+PostDown = ip6tables -t nat -D POSTROUTING -s ${WG_V6_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+PostDown = ip6tables -D FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || true
+PostDown = ip6tables -D FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+# 入口机会在后续把自己的 PublicKey 给你，你再加 Peer：
+# [Peer]
+# PublicKey = <CLIENT_PUB>
+# AllowedIPs = 10.66.66.2/32, fd10::2/128
 EOF
 
-  chmod 600 /etc/wireguard/${WG_IF}.conf
-}
+  chmod 600 "/etc/wireguard/${WG_IF}.conf"
 
-start_wg() {
-  systemctl enable --now wg-quick@${WG_IF} || true
-  systemctl restart wg-quick@${WG_IF}
-}
-
-ask_port() {
-  read -r -p "WireGuard 监听端口 [默认 ${WG_PORT_DEFAULT}]: " p
-  echo "${p:-$WG_PORT_DEFAULT}"
-}
-
-ask_endpoint_ip() {
-  echo "请输入出口机公网 IP（IPv4 或 IPv6）。建议填你确定能连到的那个："
-  read -r -p "出口机公网 IP: " eip
-  echo "$eip"
-}
-
-write_client_conf() {
-  local endpoint_ip="$1"
-  local port="$2"
-  cat >/root/wg_client.conf <<EOF
-[Interface]
-PrivateKey = ${CLIENT_PRIV}
-Address = ${WG_CLI4}, ${WG_CLI6}
-DNS = 8.8.8.8, 1.1.1.1
-
-[Peer]
-PublicKey = ${SERVER_PUB}
-PresharedKey = ${PSK}
-Endpoint = ${endpoint_ip}:${port}
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOF
-  chmod 600 /root/wg_client.conf
+  echo
+  echo "================ 出口机信息（填到入口机） ================"
+  echo "出口机公网 IPv4: $(get_pub_ip4)"
+  echo "出口机公网 IPv6: $(get_pub_ip6)"
+  echo "WireGuard 端口 : ${port}"
+  echo "Server 公钥    : ${srv_pub}"
+  echo "=========================================================="
+  echo
+  echo "下一步：去入口机跑 in.sh，它会给你 CLIENT 公钥，然后你在出口机执行："
+  echo "wg set ${WG_IF} peer <CLIENT_PUB> allowed-ips 10.66.66.2/32,fd10::2/128"
+  echo "然后在出口机执行：systemctl restart wg-quick@${WG_IF}"
+  echo
 }
 
 main() {
   need_root
-  echo "=== OUT：配置出口机 WireGuard Server + NAT ==="
-  install_pkgs
-  sysctl_on
+  os_install
+  local wan_if; wan_if="$(get_wan_if)"
+  [[ -n "${wan_if}" ]] || { echo "找不到默认外网网卡"; exit 1; }
 
-  WAN_IF="$(detect_wan_if)"
-  [ -n "$WAN_IF" ] || { echo "无法检测出口机外网网卡"; exit 1; }
-  echo "外网网卡: $WAN_IF"
+  read -r -p "WireGuard 端口（默认 ${WG_PORT_DEFAULT}）: " WG_PORT || true
+  WG_PORT="${WG_PORT:-$WG_PORT_DEFAULT}"
 
-  PORT="$(ask_port)"
-  gen_keys
-  write_server_conf "$WAN_IF" "$PORT"
-  start_wg
+  cleanup_old
+  enable_forwarding
+  make_keys
+  write_conf "${wan_if}" "${WG_PORT}"
 
-  EPIP="$(ask_endpoint_ip)"
-  write_client_conf "$EPIP" "$PORT"
-
-  echo
-  echo "================= 给入口机填这 4 项（非常关键） ================="
-  echo "出口机公网IP  : ${EPIP}"
-  echo "WireGuard端口 : ${PORT}"
-  echo "Server公钥    : ${SERVER_PUB}"
-  echo "Client私钥    : ${CLIENT_PRIV}"
-  echo "PresharedKey  : ${PSK}"
-  echo "=================================================================="
-  echo
-  echo "入口机配置文件已生成：/root/wg_client.conf （可以直接 cat 看）"
-  echo "出口机状态："
-  wg show ${WG_IF} || true
-  echo
-  echo "提示：不要把 /root/wg_client.conf 发到公开地方（里面有私钥）。"
+  systemctl enable --now "wg-quick@${WG_IF}"
+  wg show "${WG_IF}" || true
 }
 
 main "$@"
