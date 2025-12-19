@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== WireGuard 入口机（SSH 永不断版）==="
+echo "=== WireGuard 入口机（防误操作稳定版）==="
 
-# ===== 手动填写（来自出口机）=====
-SERVER_IP="出口机公网IP"
+# ====== 手动填写 ======
+SERVER_IP="185.18.221.229"
 SERVER_PORT=51820
-SERVER_PUBKEY="出口机Server公钥"
-# =================================
+SERVER_PUBKEY="在这里粘贴出口机真正的Server公钥"
+# ======================
+
+# ===== 校验公钥 =====
+if ! echo "$SERVER_PUBKEY" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
+  echo "❌ Server 公钥格式错误"
+  echo "必须是 44 位 Base64，例如："
+  echo "5pXPrl+RgawnoyZRe4PsMvA0yMsxjsR7AYtd5Ep1GBM="
+  exit 1
+fi
 
 WG_IF=wg0
 WG_ADDR=10.66.66.2/24
@@ -16,7 +24,7 @@ WG_ADDR=10.66.66.2/24
 apt update -y
 apt install -y wireguard iproute2 iptables curl
 
-# ===== 清理旧状态 =====
+# ===== 清理旧接口 =====
 ip link del $WG_IF 2>/dev/null || true
 iptables -t nat -D OUTPUT -o $WG_IF -j MASQUERADE 2>/dev/null || true
 
@@ -28,8 +36,8 @@ CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
 ip link add $WG_IF type wireguard
 wg set $WG_IF \
   private-key <(echo "$CLIENT_PRIV") \
-  peer $SERVER_PUBKEY \
-  endpoint $SERVER_IP:$SERVER_PORT \
+  peer "$SERVER_PUBKEY" \
+  endpoint "$SERVER_IP:$SERVER_PORT" \
   allowed-ips 0.0.0.0/0 \
   persistent-keepalive 25
 
@@ -40,9 +48,14 @@ ip link set $WG_IF up
 iptables -t nat -A OUTPUT -o $WG_IF -j MASQUERADE
 
 echo
-echo "============== 需要回填给出口机 =============="
+echo "================= 重要 ================="
+echo "请把下面 Client 公钥 加到出口机："
+echo
 echo "Client 公钥: $CLIENT_PUB"
-echo "=============================================="
+echo
+echo "出口机执行："
+echo "wg set wg0 peer $CLIENT_PUB allowed-ips 10.66.66.2/32"
+echo "======================================="
 echo
 wg show
 echo
