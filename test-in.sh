@@ -1,38 +1,56 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== WireGuard 入口机（手动输入 · SSH 永不掉线）==="
+echo "=== WireGuard 入口机（SSH 永不掉线版）==="
 
-apt update
-apt install -y wireguard iproute2 curl
+# 1. 修复 dpkg / 更新
+export DEBIAN_FRONTEND=noninteractive
+dpkg --configure -a || true
+apt-get update -y
+apt-get install -y wireguard iproute2 iptables curl
 
-read -p "出口机公网 IP: " SERVER_IP
-read -p "WireGuard 端口: " SERVER_PORT
-read -p "Server 公钥  : " SERVER_PUB
-read -p "Client 私钥  : " CLIENT_KEY
-
-WG_IF=wg0
-
-# 清理旧接口
+# 2. 停旧 wg
+wg-quick down wg0 2>/dev/null || true
 ip link del wg0 2>/dev/null || true
 
-# 建接口
-ip link add wg0 type wireguard
-wg set wg0 private-key <(echo "$CLIENT_KEY") peer "$SERVER_PUB" endpoint "$SERVER_IP:$SERVER_PORT" allowed-ips 0.0.0.0/0,::/0 persistent-keepalive 25
+# 3. 交互输入
+read -rp "出口机公网 IP（IPv4 或 IPv6）: " SERVER_IP
+read -rp "WireGuard 端口 [51820]: " WG_PORT
+WG_PORT=${WG_PORT:-51820}
+read -rp "Server 公钥: " SERVER_PUB
+read -rp "Client 私钥: " CLIENT_PRIV
 
-# IP
-ip addr add 10.0.0.2/24 dev wg0
-ip addr add fd10::2/64 dev wg0
-ip link set wg0 up
+# 4. 获取当前 SSH IP（保命）
+SSH_IP=$(echo "$SSH_CLIENT" | awk '{print $1}')
 
-# 低优先级默认路由（SSH 不受影响）
-ip route add default dev wg0 metric 100
-ip -6 route add default dev wg0 metric 100
+# 5. 写配置
+mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+Address = 10.0.0.2/24, fd10::2/64
+PrivateKey = ${CLIENT_PRIV}
+DNS = 8.8.8.8,1.1.1.1
+
+# SSH 保命规则：SSH 走原路由
+PostUp = ip rule add to ${SSH_IP} lookup main priority 50
+PostDown = ip rule del to ${SSH_IP} lookup main priority 50
+
+[Peer]
+PublicKey = ${SERVER_PUB}
+Endpoint = ${SERVER_IP}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+
+chmod 600 /etc/wireguard/wg0.conf
+
+# 6. 启动
+wg-quick up wg0
 
 echo
-echo "WireGuard 已连接"
-echo "当前状态："
-wg
+echo "=== WireGuard 已启动 ==="
+wg show
 echo
-echo "出口 IP 验证："
-curl -4 ip.sb
+echo "出口 IP 校验："
+curl -4 ip.sb || true
+curl -6 ip.sb || true
