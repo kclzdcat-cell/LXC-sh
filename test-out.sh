@@ -18,8 +18,35 @@ os_install() {
 get_wan_if() {
   ip -4 route show default 2>/dev/null | awk '{print $5; exit}'
 }
-get_pub_ip4() { curl -4 -s --max-time 5 https://ip.sb || true; }
-get_pub_ip6() { curl -6 -s --max-time 5 https://ip.sb || true; }
+curl_ip() {
+  # $1 = -4 or -6
+  local fam="$1"
+  local ua="Mozilla/5.0 (X11; Linux x86_64) curl/8"
+  local out=""
+
+  # 多个源依次尝试（有的机房会封某个域名）
+  for url in \
+    "https://api.ipify.org" \
+    "https://ifconfig.me/ip" \
+    "https://icanhazip.com" \
+    "https://checkip.amazonaws.com" \
+    "https://ip.sb" \
+    "https://ipinfo.io/ip"
+  do
+    out="$(curl ${fam} -fsS --max-time 6 -A "$ua" "$url" 2>/dev/null | tr -d '\r' | head -n1 || true)"
+    # 严格校验：只接受“看起来像 IP”的内容，拒绝 HTML/403/乱七八糟
+    if [[ "$fam" == "-4" ]]; then
+      [[ "$out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$out"; return 0; }
+    else
+      [[ "$out" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$out" == *:* ]] && { echo "$out"; return 0; }
+    fi
+  done
+
+  echo ""   # 全失败就输出空
+}
+
+get_pub_ip4() { curl_ip -4; }
+get_pub_ip6() { curl_ip -6; }
 
 cleanup_old() {
   systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
