@@ -1,217 +1,167 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "==========================================="
-echo " OpenVPN 出口服务器自动部署脚本 V12.1（IPv4 + IPv6 双栈 + 指纹修复版）"
-echo "==========================================="
+WG_IF="wg0"
+WG_PORT="${WG_PORT:-51820}"
+WG_ADDR4="10.66.66.1/24"
+WG_ADDR6="fd10::1/64"
+WG_DIR="/etc/wireguard"
+WG_CONF="${WG_DIR}/${WG_IF}.conf"
+WG_KEY="${WG_DIR}/${WG_IF}.key"
+WG_PUB="${WG_DIR}/${WG_IF}.pub"
 
-#----------- 检测出口 IPv4 / IPv6 -----------
-PUB_IP4=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
-PUB_IP6=$(curl -s ipv6.ip.sb || echo "")
+log(){ echo -e "\n[OUT] $*\n"; }
 
-echo "出口 IPv4: $PUB_IP4"
-echo "出口 IPv6: ${PUB_IP6:-未检测到 IPv6}"
-
-#----------- 检测网卡 -----------
-NIC=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
-echo "出口网卡: $NIC"
-
-apt update -y
-apt install -y openvpn easy-rsa sshpass iptables-persistent curl
-
-#----------- 重建 PKI -----------
-rm -rf /etc/openvpn/easy-rsa
-mkdir -p /etc/openvpn/easy-rsa
-cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
-cd /etc/openvpn/easy-rsa
-
-export EASYRSA_BATCH=1
-
-echo ">>> 初始化 PKI ..."
-./easyrsa init-pki
-
-echo ">>> 生成 CA ..."
-./easyrsa build-ca nopass
-
-echo ">>> 生成服务器证书 ..."
-./easyrsa build-server-full server nopass
-
-echo ">>> 生成客户端证书 ..."
-./easyrsa build-client-full client nopass
-
-echo ">>> 生成 DH 参数 ..."
-./easyrsa gen-dh
-
-#----------- 拷贝证书 -----------
-cp pki/ca.crt /etc/openvpn/
-cp pki/dh.pem /etc/openvpn/
-cp pki/issued/server.crt /etc/openvpn/
-cp pki/private/server.key /etc/openvpn/
-cp pki/issued/client.crt /etc/openvpn/
-cp pki/private/client.key /etc/openvpn/
-
-#----------- 查找空闲端口 -----------
-find_free_port() {
-  p=$1
-  while ss -tuln | grep -q ":$p "; do
-    p=$((p+1))
-  done
-  echo $p
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "请用 root 运行"; exit 1
+  fi
 }
 
-UDP_PORT=$(find_free_port 1194)
-TCP_PORT=$(find_free_port 443)
+wait_apt_locks() {
+  # 尽量避免 apt/dpkg 锁把你卡死
+  local locks=(
+    "/var/lib/dpkg/lock-frontend"
+    "/var/lib/dpkg/lock"
+    "/var/cache/apt/archives/lock"
+  )
+  for i in {1..120}; do
+    local busy=0
+    for l in "${locks[@]}"; do
+      if fuser "$l" >/dev/null 2>&1; then busy=1; fi
+    done
+    [[ $busy -eq 0 ]] && return 0
+    sleep 1
+  done
+  echo "apt/dpkg 锁太久了，先手动处理：ps aux | grep -E 'apt|dpkg'"; exit 1
+}
 
-echo "UDP端口 = $UDP_PORT"
-echo "TCP端口 = $TCP_PORT"
+apt_fix_and_install() {
+  log "修复 dpkg/apt & 安装依赖"
+  systemctl stop unattended-upgrades 2>/dev/null || true
+  wait_apt_locks
+  dpkg --configure -a 2>/dev/null || true
+  apt-get -y -f install 2>/dev/null || true
+  wait_apt_locks
+  apt-get update -y
 
-#----------- 启用 IPv4 / IPv6 转发 -----------
+  # Debian/Ubuntu 通吃：wireguard-tools + iproute2 + iptables + curl
+  apt-get install -y --no-install-recommends \
+    wireguard-tools iproute2 iptables curl ca-certificates
 
-echo 1 >/proc/sys/net/ipv4/ip_forward
-sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+  # 有些发行版有 wireguard 元包，装不上不算错
+  apt-get install -y --no-install-recommends wireguard 2>/dev/null || true
+}
 
-echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
-sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
+detect_wan_if() {
+  ip route show default 0.0.0.0/0 | awk 'NR==1{print $5}'
+}
 
-#----------- 配置 NAT (IPv4) -----------
-iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o $NIC -j MASQUERADE
-
-#----------- 配置 NAT (IPv6) 可用才启用 -----------
-HAS_IPV6=0
-if [[ -n "$PUB_IP6" ]]; then
-    if command -v ip6tables >/dev/null; then
-        HAS_IPV6=1
-        echo "检测到 IPv6，启用 IPv6 NAT..."
-        ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
-    fi
-fi
-
-iptables-save >/etc/iptables/rules.v4
-ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
-
-#----------- server.conf（UDP）-----------
-cat >/etc/openvpn/server.conf <<EOF
-port $UDP_PORT
-proto udp
-dev tun
-ca ca.crt
-cert server.crt
-key server.key
-dh dh.pem
-
-server 10.8.0.0 255.255.255.0
-server-ipv6 fd00:1234::/64
-
-push "redirect-gateway def1 ipv6 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
-push "dhcp-option DNS 1.1.1.1"
-push "dhcp-option DNS6 2620:119:35::35"
-push "dhcp-option DNS6 2606:4700:4700::1111"
-
-keepalive 10 120
-cipher AES-256-GCM
-auth SHA256
-persist-key
-persist-tun
-verb 3
+sysctl_forward() {
+  log "开启 IPv4/IPv6 转发"
+  mkdir -p /etc/sysctl.d
+  cat >/etc/sysctl.d/99-wg-forward.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
 EOF
+  sysctl --system >/dev/null
+}
 
-#----------- server-tcp.conf（TCP）-----------
-cat >/etc/openvpn/server-tcp.conf <<EOF
-port $TCP_PORT
-proto tcp
-dev tun
-ca ca.crt
-cert server.crt
-key server.key
-dh dh.pem
+clean_old() {
+  log "清理旧 wg0（如果有）"
+  systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
+  ip link del "${WG_IF}" >/dev/null 2>&1 || true
+}
 
-server 10.9.0.0 255.255.255.0
-server-ipv6 fd00:1234::/64
+gen_keys() {
+  log "生成/重置密钥"
+  umask 077
+  mkdir -p "${WG_DIR}"
+  if [[ -f "${WG_KEY}" ]]; then
+    # 每次重装你都想“干净”，这里直接备份再重建
+    mv -f "${WG_KEY}" "${WG_KEY}.bak.$(date +%s)" || true
+  fi
+  if [[ -f "${WG_PUB}" ]]; then
+    mv -f "${WG_PUB}" "${WG_PUB}.bak.$(date +%s)" || true
+  fi
+  wg genkey | tee "${WG_KEY}" | wg pubkey > "${WG_PUB}"
+  chmod 600 "${WG_KEY}" "${WG_PUB}"
+}
 
-push "redirect-gateway def1 ipv6 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
-push "dhcp-option DNS 1.1.1.1"
-push "dhcp-option DNS6 2620:119:35::35"
-push "dhcp-option DNS6 2606:4700:4700::1111"
+write_conf() {
+  local wan_if="$1"
+  log "写入 ${WG_CONF}"
+  cat >"${WG_CONF}" <<EOF
+[Interface]
+Address = ${WG_ADDR4}, ${WG_ADDR6}
+ListenPort = ${WG_PORT}
+PrivateKey = $(cat "${WG_KEY}")
 
-keepalive 10 120
-cipher AES-256-GCM
-auth SHA256
-persist-key
-persist-tun
-verb 3
+# NAT：让入口机的出站最终显示“出口机公网IP”
+PostUp   = iptables -t nat -C POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+
+# IPv6 NAT（如果你出口机有 v6 且内核允许 nat 表）
+PostUp   = ip6tables -t nat -C POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+PostDown = ip6tables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
 EOF
+  chmod 600 "${WG_CONF}"
+}
 
-#----------- 启动服务 -----------
-systemctl enable openvpn@server
-systemctl restart openvpn@server
-systemctl enable openvpn@server-tcp
-systemctl restart openvpn@server-tcp
+start_wg() {
+  log "启动 WireGuard"
+  systemctl enable --now "wg-quick@${WG_IF}" >/dev/null
+  sleep 1
+}
 
-#----------- 生成 client.ovpn -----------
-CLIENT=/root/client.ovpn
-cat >$CLIENT <<EOF
-client
-dev tun
-nobind
-persist-key
-persist-tun
-remote-cert-tls server
-cipher AES-256-GCM
-auth SHA256
-auth-nocache
-resolv-retry infinite
+get_pub_ip() {
+  # 多个源兜底，避免你遇到的 ip.sb 403
+  local ip4 ip6
+  ip4="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip4}" ]] && ip4="$(curl -4 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
+  ip6="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip6}" ]] && ip6="$(curl -6 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
+  echo "${ip4}|${ip6}"
+}
 
-remote $PUB_IP4 $UDP_PORT udp
-remote $PUB_IP4 $TCP_PORT tcp
-EOF
+print_info() {
+  local wan_if="$1"
+  local ips server_pub
+  ips="$(get_pub_ip)"
+  local ip4="${ips%%|*}"
+  local ip6="${ips#*|}"
+  server_pub="$(cat "${WG_PUB}")"
 
-# 自动加入 IPv6 远程
-if [[ $HAS_IPV6 -eq 1 ]]; then
-cat >>$CLIENT <<EOF
-remote $PUB_IP6 $UDP_PORT udp
-remote $PUB_IP6 $TCP_PORT tcp
-EOF
-fi
+  log "给入口机填这三项（手动填，最稳）"
+  echo "出口机公网 IPv4: ${ip4:-（获取失败，手动填）}"
+  echo "出口机公网 IPv6: ${ip6:-（可空）}"
+  echo "WireGuard 端口  : ${WG_PORT}"
+  echo "出口机 Server 公钥: ${server_pub}"
+  echo
+  echo "出口机当前状态："
+  wg show "${WG_IF}" || true
+  echo
+  echo "下一步：去入口机跑 in.sh，它会给你一个 CLIENT 公钥。"
+  echo "然后回到出口机执行："
+  echo "  wg set ${WG_IF} peer <CLIENT_PUB> allowed-ips 10.66.66.2/32,fd10::2/128"
+  echo "  wg-quick save ${WG_IF}"
+  echo
+  echo "（可选）如果你想确认 NAT 出口是否正常：入口机连上后，入口机 curl -4 api.ipify.org 应该显示这里的出口 IPv4。"
+}
 
-cat >>$CLIENT <<EOF
+main(){
+  need_root
+  apt_fix_and_install
+  sysctl_forward
+  clean_old
+  gen_keys
+  local wan_if
+  wan_if="$(detect_wan_if)"
+  [[ -z "${wan_if}" ]] && { echo "找不到默认外网网卡"; exit 1; }
+  write_conf "${wan_if}"
+  start_wg
+  print_info "${wan_if}"
+}
 
-<ca>
-$(cat /etc/openvpn/ca.crt)
-</ca>
-
-<cert>
-$(cat /etc/openvpn/client.crt)
-</cert>
-
-<key>
-$(cat /etc/openvpn/client.key)
-</key>
-EOF
-
-echo "client.ovpn 已生成：/root/client.ovpn"
-
-#----------- 上传到入口服务器 -----------
-echo "请输入入口服务器 SSH 信息："
-read -p "入口 IP：" IN_IP
-read -p "入口端口(默认22)：" IN_PORT
-IN_PORT=${IN_PORT:-22}
-read -p "入口 SSH 用户(默认root)：" IN_USER
-IN_USER=${IN_USER:-root}
-read -p "入口 SSH 密码：" IN_PASS
-
-echo ">>> 正在清理旧的主机指纹..."
-mkdir -p /root/.ssh
-touch /root/.ssh/known_hosts
-# 尝试删除纯 IP 记录
-ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
-# 尝试删除 [IP]:Port 格式的记录 (非标准端口常见)
-ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
-
-echo ">>> 开始传输文件..."
-# 添加了 -o UserKnownHostsFile=/dev/null 作为双重保险，强制忽略指纹差异
-sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $CLIENT $IN_USER@$IN_IP:/root/
-
-echo "上传成功！出口服务器部署完成！"
-echo "==========================================="
+main "$@"
