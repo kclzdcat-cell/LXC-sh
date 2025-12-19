@@ -3,16 +3,20 @@ set -euo pipefail
 
 # =========================================================
 # WireGuard Ingress Script
-# Version : 2.1
-# Feature : IPv4 / IPv6 可选出口（IPv6 可交互选择）
+# Version : 2.2
+# Feature :
+#   - IPv4 强制走出口机
+#   - IPv6 可选是否走出口机（交互选择）
+#   - 完整部署流程控制（人工确认）
+#   - 最终 IPv4 / IPv6 出口验证
 # =========================================================
 
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.2"
 
-echo "========================================"
+echo "=================================================="
 echo " WireGuard Ingress Script v${SCRIPT_VERSION}"
-echo " 支持 IPv4 / IPv6 出口控制"
-echo "========================================"
+echo " IPv4 强制出口 / IPv6 可选出口"
+echo "=================================================="
 echo
 
 # ================== 参数 ==================
@@ -29,9 +33,12 @@ WG_CONF="${WG_DIR}/${WG_IF}.conf"
 WG_KEY="${WG_DIR}/${WG_IF}.key"
 WG_PUB="${WG_DIR}/${WG_IF}.pub"
 
+# ================== IPv6 出口开关（运行时选择） ==================
+USE_V6_OUT="no"
+
 log(){ echo -e "\n[IN] $*\n"; }
 
-# ================== 权限检查 ==================
+# ================== 基础 ==================
 need_root() {
   [[ "${EUID}" -eq 0 ]] || { echo "❌ 请用 root 运行"; exit 1; }
 }
@@ -46,18 +53,13 @@ select_ipv6_mode() {
   read -r -p "请选择 [1/2]（默认 1）: " choice
 
   case "${choice:-1}" in
-    2)
-      USE_V6_OUT="yes"
-      ;;
-    *)
-      USE_V6_OUT="no"
-      ;;
+    2) USE_V6_OUT="yes" ;;
+    *) USE_V6_OUT="no" ;;
   esac
 
   log "IPv6 出口模式：${USE_V6_OUT}"
 }
 
-# ================== apt 处理 ==================
 wait_apt_locks() {
   for i in {1..120}; do
     fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break
@@ -77,7 +79,6 @@ apt_fix_and_install() {
     wireguard-tools iproute2 iptables curl ca-certificates
 }
 
-# ================== 主出口检测 ==================
 detect_main() {
   local line gw ifc
   line="$(ip route show default | head -n1)"
@@ -88,7 +89,7 @@ detect_main() {
 
 # ================== 清理 ==================
 clean_old() {
-  log "清理旧 WireGuard"
+  log "清理旧 WG（不动默认路由）"
   systemctl disable --now wg-quick@${WG_IF} 2>/dev/null || true
   wg-quick down ${WG_IF} 2>/dev/null || true
   ip link del ${WG_IF} 2>/dev/null || true
@@ -108,7 +109,7 @@ gen_keys() {
   chmod 600 "${WG_KEY}" "${WG_PUB}"
 }
 
-# ================== 写配置 ==================
+# ================== 配置 ==================
 write_conf() {
   local server_ip="$1"
   local server_port="$2"
@@ -125,6 +126,7 @@ Address = ${WG_ADDR4}, ${WG_ADDR6}
 PrivateKey = $(cat "${WG_KEY}")
 Table = off
 
+# MTU 必须在 WG 接管流量前生效
 PostUp   = ip link set dev ${WG_IF} mtu ${WG_MTU}
 PostDown = ip link set dev ${WG_IF} mtu 1420 || true
 
@@ -132,7 +134,7 @@ PostDown = ip link set dev ${WG_IF} mtu 1420 || true
 PostUp   = iptables -t mangle -A PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
 PostUp   = iptables -t mangle -A OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
 
-# 出口机 endpoint 永远走 main
+# 出口机 endpoint 永远走 main 表
 PostUp   = ip rule add priority 50 to ${server_ip} lookup main
 
 # IPv4 policy routing
@@ -165,8 +167,31 @@ EOF
 
 # ================== 启动 ==================
 start_wg() {
-  log "启动 WireGuard"
+  log "启动 WG"
   systemctl enable --now wg-quick@${WG_IF}
+}
+
+# ================== 人工同步 ==================
+pause_for_peer() {
+  echo
+  echo "================ 等待出口机对接 ================="
+  echo "请在【出口机】执行："
+  echo "  wg set wg0 peer $(cat ${WG_PUB}) allowed-ips 10.66.66.2/32,fd10::2/128"
+  echo "  wg-quick save wg0"
+  echo
+  read -r -p "出口机完成后，回到这里按 Enter 继续..." _
+}
+
+# ================== 最终验证 ==================
+verify() {
+  log "最终出口验证"
+
+  echo "IPv4 出口（curl ipinfo.io）："
+  curl --max-time 10 ipinfo.io || true
+  echo
+
+  echo "IPv6 出口（curl -6 ip.sb）："
+  curl -6 --max-time 10 ip.sb || true
 }
 
 # ================== 主流程 ==================
@@ -191,6 +216,12 @@ write_conf "${SERVER_IP}" "${SERVER_PORT}" "${SERVER_PUB}"
 start_wg
 
 echo
-echo "====== CLIENT 公钥 ======"
+echo "====== CLIENT 公钥（复制到出口机） ======"
 cat "${WG_PUB}"
-echo "========================="
+echo "=========================================="
+
+pause_for_peer
+verify
+
+echo
+echo "✅ 完成（IPv6 出口模式：${USE_V6_OUT}）"
