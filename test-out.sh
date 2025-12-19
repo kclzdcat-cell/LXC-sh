@@ -2,146 +2,166 @@
 set -euo pipefail
 
 WG_IF="wg0"
-WG_PORT_DEFAULT="51820"
-WG_V4_NET="10.66.66.0/24"
-WG_V4_SRV="10.66.66.1/24"
-WG_V6_NET="fd10::/64"
-WG_V6_SRV="fd10::1/64"
+WG_PORT="${WG_PORT:-51820}"
+WG_ADDR4="10.66.66.1/24"
+WG_ADDR6="fd10::1/64"
+WG_DIR="/etc/wireguard"
+WG_CONF="${WG_DIR}/${WG_IF}.conf"
+WG_KEY="${WG_DIR}/${WG_IF}.key"
+WG_PUB="${WG_DIR}/${WG_IF}.pub"
 
-need_root() { [[ ${EUID:-0} -eq 0 ]] || { echo "请用 root 执行"; exit 1; }; }
-os_install() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    wireguard wireguard-tools iproute2 iptables nftables curl ca-certificates
-}
-get_wan_if() {
-  ip -4 route show default 2>/dev/null | awk '{print $5; exit}'
-}
-curl_ip() {
-  # $1 = -4 or -6
-  local fam="$1"
-  local ua="Mozilla/5.0 (X11; Linux x86_64) curl/8"
-  local out=""
+log(){ echo -e "\n[OUT] $*\n"; }
 
-  # 多个源依次尝试（有的机房会封某个域名）
-  for url in \
-    "https://api.ipify.org" \
-    "https://ifconfig.me/ip" \
-    "https://icanhazip.com" \
-    "https://checkip.amazonaws.com" \
-    "https://ip.sb" \
-    "https://ipinfo.io/ip"
-  do
-    out="$(curl ${fam} -fsS --max-time 6 -A "$ua" "$url" 2>/dev/null | tr -d '\r' | head -n1 || true)"
-    # 严格校验：只接受“看起来像 IP”的内容，拒绝 HTML/403/乱七八糟
-    if [[ "$fam" == "-4" ]]; then
-      [[ "$out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$out"; return 0; }
-    else
-      [[ "$out" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$out" == *:* ]] && { echo "$out"; return 0; }
-    fi
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "请用 root 运行"; exit 1
+  fi
+}
+
+wait_apt_locks() {
+  # 尽量避免 apt/dpkg 锁把你卡死
+  local locks=(
+    "/var/lib/dpkg/lock-frontend"
+    "/var/lib/dpkg/lock"
+    "/var/cache/apt/archives/lock"
+  )
+  for i in {1..120}; do
+    local busy=0
+    for l in "${locks[@]}"; do
+      if fuser "$l" >/dev/null 2>&1; then busy=1; fi
+    done
+    [[ $busy -eq 0 ]] && return 0
+    sleep 1
   done
-
-  echo ""   # 全失败就输出空
+  echo "apt/dpkg 锁太久了，先手动处理：ps aux | grep -E 'apt|dpkg'"; exit 1
 }
 
-get_pub_ip4() { curl_ip -4; }
-get_pub_ip6() { curl_ip -6; }
+apt_fix_and_install() {
+  log "修复 dpkg/apt & 安装依赖"
+  systemctl stop unattended-upgrades 2>/dev/null || true
+  wait_apt_locks
+  dpkg --configure -a 2>/dev/null || true
+  apt-get -y -f install 2>/dev/null || true
+  wait_apt_locks
+  apt-get update -y
 
-cleanup_old() {
-  systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
-  wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
-  ip link del "${WG_IF}" >/dev/null 2>&1 || true
-  rm -f "/etc/wireguard/${WG_IF}.conf"
+  # Debian/Ubuntu 通吃：wireguard-tools + iproute2 + iptables + curl
+  apt-get install -y --no-install-recommends \
+    wireguard-tools iproute2 iptables curl ca-certificates
+
+  # 有些发行版有 wireguard 元包，装不上不算错
+  apt-get install -y --no-install-recommends wireguard 2>/dev/null || true
 }
 
-enable_forwarding() {
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
-  cat >/etc/sysctl.d/99-wg-forward.conf <<EOF
+detect_wan_if() {
+  ip route show default 0.0.0.0/0 | awk 'NR==1{print $5}'
+}
+
+sysctl_forward() {
+  log "开启 IPv4/IPv6 转发"
+  mkdir -p /etc/sysctl.d
+  cat >/etc/sysctl.d/99-wg-forward.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 EOF
+  sysctl --system >/dev/null
 }
 
-make_keys() {
+clean_old() {
+  log "清理旧 wg0（如果有）"
+  systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
+  ip link del "${WG_IF}" >/dev/null 2>&1 || true
+}
+
+gen_keys() {
+  log "生成/重置密钥"
   umask 077
-  mkdir -p /etc/wireguard
-  if [[ ! -f /etc/wireguard/server.key ]]; then
-    wg genkey | tee /etc/wireguard/server.key >/dev/null
+  mkdir -p "${WG_DIR}"
+  if [[ -f "${WG_KEY}" ]]; then
+    # 每次重装你都想“干净”，这里直接备份再重建
+    mv -f "${WG_KEY}" "${WG_KEY}.bak.$(date +%s)" || true
   fi
-  wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
+  if [[ -f "${WG_PUB}" ]]; then
+    mv -f "${WG_PUB}" "${WG_PUB}.bak.$(date +%s)" || true
+  fi
+  wg genkey | tee "${WG_KEY}" | wg pubkey > "${WG_PUB}"
+  chmod 600 "${WG_KEY}" "${WG_PUB}"
 }
 
 write_conf() {
   local wan_if="$1"
-  local port="$2"
-  local srv_priv srv_pub
-  srv_priv="$(cat /etc/wireguard/server.key)"
-  srv_pub="$(cat /etc/wireguard/server.pub)"
-
-  cat >"/etc/wireguard/${WG_IF}.conf" <<EOF
+  log "写入 ${WG_CONF}"
+  cat >"${WG_CONF}" <<EOF
 [Interface]
-Address = ${WG_V4_SRV}, ${WG_V6_SRV}
-ListenPort = ${port}
-PrivateKey = ${srv_priv}
+Address = ${WG_ADDR4}, ${WG_ADDR6}
+ListenPort = ${WG_PORT}
+PrivateKey = $(cat "${WG_KEY}")
 
-# NAT + Forward (IPv4)
-PostUp = iptables -t nat -C POSTROUTING -s ${WG_V4_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_V4_NET} -o ${wan_if} -j MASQUERADE
-PostUp = iptables -C FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT
-PostUp = iptables -C FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# NAT：让入口机的出站最终显示“出口机公网IP”
+PostUp   = iptables -t nat -C POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
 
-PostDown = iptables -t nat -D POSTROUTING -s ${WG_V4_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || true
-PostDown = iptables -D FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || true
-PostDown = iptables -D FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-# NAT66 + Forward (IPv6) - 若内核/iptables 不支持 NAT66，此段可能无效，但不影响 IPv4
-PostUp = ip6tables -t nat -C POSTROUTING -s ${WG_V6_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -s ${WG_V6_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || true
-PostUp = ip6tables -C FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || true
-PostUp = ip6tables -C FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-PostDown = ip6tables -t nat -D POSTROUTING -s ${WG_V6_NET} -o ${wan_if} -j MASQUERADE 2>/dev/null || true
-PostDown = ip6tables -D FORWARD -i ${WG_IF} -o ${wan_if} -j ACCEPT 2>/dev/null || true
-PostDown = ip6tables -D FORWARD -i ${wan_if} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-# 入口机会在后续把自己的 PublicKey 给你，你再加 Peer：
-# [Peer]
-# PublicKey = <CLIENT_PUB>
-# AllowedIPs = 10.66.66.2/32, fd10::2/128
+# IPv6 NAT（如果你出口机有 v6 且内核允许 nat 表）
+PostUp   = ip6tables -t nat -C POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
+PostDown = ip6tables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE 2>/dev/null || true
 EOF
-
-  chmod 600 "/etc/wireguard/${WG_IF}.conf"
-
-  echo
-  echo "================ 出口机信息（填到入口机） ================"
-  echo "出口机公网 IPv4: $(get_pub_ip4)"
-  echo "出口机公网 IPv6: $(get_pub_ip6)"
-  echo "WireGuard 端口 : ${port}"
-  echo "Server 公钥    : ${srv_pub}"
-  echo "=========================================================="
-  echo
-  echo "下一步：去入口机跑 in.sh，它会给你 CLIENT 公钥，然后你在出口机执行："
-  echo "wg set ${WG_IF} peer <CLIENT_PUB> allowed-ips 10.66.66.2/32,fd10::2/128"
-  echo "然后在出口机执行：systemctl restart wg-quick@${WG_IF}"
-  echo
+  chmod 600 "${WG_CONF}"
 }
 
-main() {
-  need_root
-  os_install
-  local wan_if; wan_if="$(get_wan_if)"
-  [[ -n "${wan_if}" ]] || { echo "找不到默认外网网卡"; exit 1; }
+start_wg() {
+  log "启动 WireGuard"
+  systemctl enable --now "wg-quick@${WG_IF}" >/dev/null
+  sleep 1
+}
 
-  read -r -p "WireGuard 端口（默认 ${WG_PORT_DEFAULT}）: " WG_PORT || true
-  WG_PORT="${WG_PORT:-$WG_PORT_DEFAULT}"
+get_pub_ip() {
+  # 多个源兜底，避免你遇到的 ip.sb 403
+  local ip4 ip6
+  ip4="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip4}" ]] && ip4="$(curl -4 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
+  ip6="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip6}" ]] && ip6="$(curl -6 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
+  echo "${ip4}|${ip6}"
+}
 
-  cleanup_old
-  enable_forwarding
-  make_keys
-  write_conf "${wan_if}" "${WG_PORT}"
+print_info() {
+  local wan_if="$1"
+  local ips server_pub
+  ips="$(get_pub_ip)"
+  local ip4="${ips%%|*}"
+  local ip6="${ips#*|}"
+  server_pub="$(cat "${WG_PUB}")"
 
-  systemctl enable --now "wg-quick@${WG_IF}"
+  log "给入口机填这三项（手动填，最稳）"
+  echo "出口机公网 IPv4: ${ip4:-（获取失败，手动填）}"
+  echo "出口机公网 IPv6: ${ip6:-（可空）}"
+  echo "WireGuard 端口  : ${WG_PORT}"
+  echo "出口机 Server 公钥: ${server_pub}"
+  echo
+  echo "出口机当前状态："
   wg show "${WG_IF}" || true
+  echo
+  echo "下一步：去入口机跑 in.sh，它会给你一个 CLIENT 公钥。"
+  echo "然后回到出口机执行："
+  echo "  wg set ${WG_IF} peer <CLIENT_PUB> allowed-ips 10.66.66.2/32,fd10::2/128"
+  echo "  wg-quick save ${WG_IF}"
+  echo
+  echo "（可选）如果你想确认 NAT 出口是否正常：入口机连上后，入口机 curl -4 api.ipify.org 应该显示这里的出口 IPv4。"
+}
+
+main(){
+  need_root
+  apt_fix_and_install
+  sysctl_forward
+  clean_old
+  gen_keys
+  local wan_if
+  wan_if="$(detect_wan_if)"
+  [[ -z "${wan_if}" ]] && { echo "找不到默认外网网卡"; exit 1; }
+  write_conf "${wan_if}"
+  start_wg
+  print_info "${wan_if}"
 }
 
 main "$@"
