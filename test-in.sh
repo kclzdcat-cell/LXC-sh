@@ -1,53 +1,50 @@
 #!/usr/bin/env bash
 set -e
 
-WG_IF="wg0"
-WG_MARK=51820
-WG_TABLE=51820
+echo "=== WireGuard 入口机（SSH 永不断版）==="
 
-# ====== 你从出口机复制过来的信息 ======
+# ===== 手动填写（来自出口机）=====
 SERVER_IP="出口机公网IP"
 SERVER_PORT=51820
 SERVER_PUBKEY="出口机Server公钥"
-CLIENT_PRIVKEY="Client私钥"
-# ======================================
+# =================================
 
+WG_IF=wg0
+WG_ADDR=10.66.66.2/24
+
+# ===== 安装依赖 =====
 apt update -y
-apt install -y wireguard iptables iproute2 curl
+apt install -y wireguard iproute2 iptables curl
 
-# 清理旧环境
-wg-quick down ${WG_IF} 2>/dev/null || true
-ip link del ${WG_IF} 2>/dev/null || true
-iptables -t mangle -F
-ip rule del fwmark ${WG_MARK} table ${WG_TABLE} 2>/dev/null || true
-ip route flush table ${WG_TABLE}
+# ===== 清理旧状态 =====
+ip link del $WG_IF 2>/dev/null || true
+iptables -t nat -D OUTPUT -o $WG_IF -j MASQUERADE 2>/dev/null || true
 
-# 创建 WG 接口
-ip link add ${WG_IF} type wireguard
-wg set ${WG_IF} private-key <(echo "${CLIENT_PRIVKEY}") peer ${SERVER_PUBKEY} endpoint ${SERVER_IP}:${SERVER_PORT} allowed-ips 0.0.0.0/0 persistent-keepalive 25
+# ===== 生成 Client 密钥 =====
+CLIENT_PRIV=$(wg genkey)
+CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
 
-ip addr add 10.66.66.2/24 dev ${WG_IF}
-ip link set ${WG_IF} up
+# ===== 创建 WireGuard =====
+ip link add $WG_IF type wireguard
+wg set $WG_IF \
+  private-key <(echo "$CLIENT_PRIV") \
+  peer $SERVER_PUBKEY \
+  endpoint $SERVER_IP:$SERVER_PORT \
+  allowed-ips 0.0.0.0/0 \
+  persistent-keepalive 25
 
-# ===== 核心：策略路由（不会断 SSH） =====
+ip addr add $WG_ADDR dev $WG_IF
+ip link set $WG_IF up
 
-# 1. WG fwmark
-wg set ${WG_IF} fwmark ${WG_MARK}
-
-# 2. WG 路由表
-ip route add default dev ${WG_IF} table ${WG_TABLE}
-ip rule add fwmark ${WG_MARK} table ${WG_TABLE}
-
-# 3. mangle OUTPUT（顺序非常关键）
-iptables -t mangle -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-iptables -t mangle -A OUTPUT -p tcp --dport 22 -j RETURN
-iptables -t mangle -A OUTPUT -o lo -j RETURN
-iptables -t mangle -A OUTPUT -j MARK --set-mark ${WG_MARK}
-
-# 刷新缓存
-ip route flush cache
+# ===== 只劫持出站 =====
+iptables -t nat -A OUTPUT -o $WG_IF -j MASQUERADE
 
 echo
-echo "=== WireGuard 已启用（SSH 不会断） ==="
-echo "当前出口 IP："
+echo "============== 需要回填给出口机 =============="
+echo "Client 公钥: $CLIENT_PUB"
+echo "=============================================="
+echo
+wg show
+echo
+echo "出口 IP 验证："
 curl -4 ip.sb || true
