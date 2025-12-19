@@ -3,19 +3,16 @@ set -euo pipefail
 
 # =========================================================
 # WireGuard Ingress Script
-# Version : 2.2
-# Feature :
-#   - IPv4 强制走出口机
-#   - IPv6 可选是否走出口机（交互选择）
-#   - 完整部署流程控制（人工确认）
-#   - 最终 IPv4 / IPv6 出口验证
+# Base   : 原始稳定版 in.sh
+# Mode   : 方案 A（最小增强，永不断网）
+# Version: 1.1
 # =========================================================
 
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="1.1"
 
 echo "=================================================="
 echo " WireGuard Ingress Script v${SCRIPT_VERSION}"
-echo " IPv4 强制出口 / IPv6 可选出口"
+echo " 基线稳定版 + IPv6 可选（方案 A）"
 echo "=================================================="
 echo
 
@@ -33,31 +30,11 @@ WG_CONF="${WG_DIR}/${WG_IF}.conf"
 WG_KEY="${WG_DIR}/${WG_IF}.key"
 WG_PUB="${WG_DIR}/${WG_IF}.pub"
 
-# ================== IPv6 出口开关（运行时选择） ==================
-USE_V6_OUT="no"
-
 log(){ echo -e "\n[IN] $*\n"; }
 
 # ================== 基础 ==================
 need_root() {
-  [[ "${EUID}" -eq 0 ]] || { echo "❌ 请用 root 运行"; exit 1; }
-}
-
-# ================== IPv6 交互选择 ==================
-select_ipv6_mode() {
-  echo
-  echo "是否让 IPv6 也走出口机？"
-  echo "  1) 否（推荐，IPv6 走入口机本地）"
-  echo "  2) 是（IPv4 + IPv6 全走出口机）"
-  echo
-  read -r -p "请选择 [1/2]（默认 1）: " choice
-
-  case "${choice:-1}" in
-    2) USE_V6_OUT="yes" ;;
-    *) USE_V6_OUT="no" ;;
-  esac
-
-  log "IPv6 出口模式：${USE_V6_OUT}"
+  [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
 }
 
 wait_apt_locks() {
@@ -109,16 +86,34 @@ gen_keys() {
   chmod 600 "${WG_KEY}" "${WG_PUB}"
 }
 
+# ================== IPv6 选择（NEW，默认不接管） ==================
+select_ipv6_mode() {
+  echo
+  echo "是否让 IPv6 也走出口机？"
+  echo "  1) 否（默认，IPv6 走入口机本地，最稳）"
+  echo "  2) 是（IPv4 + IPv6 都走出口机）"
+  echo
+  read -r -p "请选择 [1/2]（默认 1）: " choice
+
+  case "${choice:-1}" in
+    2) USE_V6_OUT="yes" ;;
+    *) USE_V6_OUT="no" ;;
+  esac
+
+  log "IPv6 出口模式：${USE_V6_OUT}"
+}
+
 # ================== 配置 ==================
 write_conf() {
   local server_ip="$1"
   local server_port="$2"
   local server_pub="$3"
 
+  ### NEW: AllowedIPs 按 IPv6 模式决定
   local allowed_ips="0.0.0.0/0"
   [[ "${USE_V6_OUT}" == "yes" ]] && allowed_ips="0.0.0.0/0, ::/0"
 
-  log "写入 ${WG_CONF}"
+  log "写入 wg0.conf（保持原始稳定逻辑）"
 
   cat >"${WG_CONF}" <<EOF
 [Interface]
@@ -126,32 +121,30 @@ Address = ${WG_ADDR4}, ${WG_ADDR6}
 PrivateKey = $(cat "${WG_KEY}")
 Table = off
 
-# MTU 必须在 WG 接管流量前生效
+# MTU 在接管流量前生效
 PostUp   = ip link set dev ${WG_IF} mtu ${WG_MTU}
 PostDown = ip link set dev ${WG_IF} mtu 1420 || true
 
-# 保护 SSH / 原连接
+# 保护原网卡进入的连接（SSH 永不掉）
 PostUp   = iptables -t mangle -A PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
 PostUp   = iptables -t mangle -A OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
 
-# 出口机 endpoint 永远走 main 表
+# 出口机 endpoint 永远走 main（防套娃）
 PostUp   = ip rule add priority 50 to ${server_ip} lookup main
 
-# IPv4 policy routing
+# WG 专用路由表（IPv4，保持原样）
 PostUp   = ip route add default dev ${WG_IF} table ${WG_TABLE}
 PostUp   = ip rule add priority 100 fwmark ${WG_MARK} lookup main
 PostUp   = ip rule add priority 200 lookup ${WG_TABLE}
+PostUp   = ip route flush cache
 
-# IPv6 policy routing（可选）
+# IPv6：仅当明确选择时才接管（NEW，且不影响 IPv4）
 PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 route add default dev ${WG_IF} table ${WG_TABLE} || true
 PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 rule add priority 200 lookup ${WG_TABLE} || true
-
-PostUp   = ip route flush cache
 
 PostDown = ip rule del priority 50 to ${server_ip} lookup main
 PostDown = ip rule del priority 100 fwmark ${WG_MARK} lookup main
 PostDown = ip rule del priority 200 lookup ${WG_TABLE}
-PostDown = ip -6 rule del priority 200 lookup ${WG_TABLE} 2>/dev/null || true
 PostDown = ip route flush table ${WG_TABLE}
 PostDown = ip -6 route flush table ${WG_TABLE}
 PostDown = iptables -t mangle -D PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
@@ -167,11 +160,10 @@ EOF
 
 # ================== 启动 ==================
 start_wg() {
-  log "启动 WG"
+  log "启动 WG（保持原始顺序）"
   systemctl enable --now wg-quick@${WG_IF}
 }
 
-# ================== 人工同步 ==================
 pause_for_peer() {
   echo
   echo "================ 等待出口机对接 ================="
@@ -182,7 +174,7 @@ pause_for_peer() {
   read -r -p "出口机完成后，回到这里按 Enter 继续..." _
 }
 
-# ================== 最终验证 ==================
+# ================== 最终验证（NEW） ==================
 verify() {
   log "最终出口验证"
 
@@ -224,4 +216,5 @@ pause_for_peer
 verify
 
 echo
-echo "✅ 完成（IPv6 出口模式：${USE_V6_OUT}）"
+echo "✅ 完成（方案 A，IPv6 出口模式：${USE_V6_OUT}）"
+echo "紧急回滚：wg-quick down ${WG_IF}"
