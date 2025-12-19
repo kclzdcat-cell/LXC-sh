@@ -2,33 +2,25 @@
 set -euo pipefail
 
 # =========================================================
-# WireGuard Ingress Script
-# Base   : 原始稳定版 in.sh
-# Mode   : 方案 A（最小增强，永不断网）
-# Version: 1.1
+# OpenVPN Ingress Script (IN)
+# Base   : 原 WireGuard in.sh 结构等价迁移
+# Mode   : OpenVPN TCP + policy routing
+# Version: 1.0
 # =========================================================
 
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.0"
 
 echo "=================================================="
-echo " WireGuard Ingress Script v${SCRIPT_VERSION}"
-echo " 基线稳定版 + IPv6 可选（方案 A）"
+echo " OpenVPN Ingress Script v${SCRIPT_VERSION}"
+echo " 入口机"
 echo "=================================================="
 echo
 
 # ================== 参数 ==================
-WG_IF="wg0"
-WG_TABLE="51820"
-WG_MARK="0x1"
-WG_MTU="1280"
-
-WG_ADDR4="10.66.66.2/32"
-WG_ADDR6="fd10::2/128"
-
-WG_DIR="/etc/wireguard"
-WG_CONF="${WG_DIR}/${WG_IF}.conf"
-WG_KEY="${WG_DIR}/${WG_IF}.key"
-WG_PUB="${WG_DIR}/${WG_IF}.pub"
+OVPN_IF="tun0"
+OVPN_TABLE="51820"
+OVPN_MARK="0x1"
+OVPN_CONF="/root/client.ovpn"
 
 log(){ echo -e "\n[IN] $*\n"; }
 
@@ -53,7 +45,7 @@ apt_fix_and_install() {
   wait_apt_locks
   apt-get update -y
   apt-get install -y --no-install-recommends \
-    wireguard-tools iproute2 iptables curl ca-certificates
+    openvpn iproute2 iptables curl ca-certificates
 }
 
 detect_main() {
@@ -66,155 +58,63 @@ detect_main() {
 
 # ================== 清理 ==================
 clean_old() {
-  log "清理旧 WG（不动默认路由）"
-  systemctl disable --now wg-quick@${WG_IF} 2>/dev/null || true
-  wg-quick down ${WG_IF} 2>/dev/null || true
-  ip link del ${WG_IF} 2>/dev/null || true
+  log "清理旧 OpenVPN / 路由规则（不动默认路由）"
+  pkill openvpn 2>/dev/null || true
 
-  ip rule del fwmark ${WG_MARK} lookup main 2>/dev/null || true
-  ip rule del lookup ${WG_TABLE} 2>/dev/null || true
-  ip route flush table ${WG_TABLE} 2>/dev/null || true
-  ip -6 route flush table ${WG_TABLE} 2>/dev/null || true
-}
+  ip rule del fwmark ${OVPN_MARK} lookup ${OVPN_TABLE} 2>/dev/null || true
+  ip rule del lookup ${OVPN_TABLE} 2>/dev/null || true
+  ip route flush table ${OVPN_TABLE} 2>/dev/null || true
 
-# ================== Key ==================
-gen_keys() {
-  log "生成入口机密钥"
-  umask 077
-  mkdir -p "${WG_DIR}"
-  wg genkey | tee "${WG_KEY}" | wg pubkey > "${WG_PUB}"
-  chmod 600 "${WG_KEY}" "${WG_PUB}"
-}
-
-# ================== IPv6 选择（NEW，默认不接管） ==================
-select_ipv6_mode() {
-  echo
-  echo "是否让 IPv6 也走出口机？"
-  echo "  1) 否（默认，IPv6 走入口机本地，最稳）"
-  echo "  2) 是（IPv4 + IPv6 都走出口机）"
-  echo
-  read -r -p "请选择 [1/2]（默认 1）: " choice
-
-  case "${choice:-1}" in
-    2) USE_V6_OUT="yes" ;;
-    *) USE_V6_OUT="no" ;;
-  esac
-
-  log "IPv6 出口模式：${USE_V6_OUT}"
-}
-
-# ================== 配置 ==================
-write_conf() {
-  local server_ip="$1"
-  local server_port="$2"
-  local server_pub="$3"
-
-  ### NEW: AllowedIPs 按 IPv6 模式决定
-  local allowed_ips="0.0.0.0/0"
-  [[ "${USE_V6_OUT}" == "yes" ]] && allowed_ips="0.0.0.0/0, ::/0"
-
-  log "写入 wg0.conf（保持原始稳定逻辑）"
-
-  cat >"${WG_CONF}" <<EOF
-[Interface]
-Address = ${WG_ADDR4}, ${WG_ADDR6}
-PrivateKey = $(cat "${WG_KEY}")
-Table = off
-
-# MTU 在接管流量前生效
-PostUp   = ip link set dev ${WG_IF} mtu ${WG_MTU}
-PostDown = ip link set dev ${WG_IF} mtu 1420 || true
-
-# 保护原网卡进入的连接（SSH 永不掉）
-PostUp   = iptables -t mangle -A PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
-PostUp   = iptables -t mangle -A OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
-
-# 出口机 endpoint 永远走 main（防套娃）
-PostUp   = ip rule add priority 50 to ${server_ip} lookup main
-
-# WG 专用路由表（IPv4，保持原样）
-PostUp   = ip route add default dev ${WG_IF} table ${WG_TABLE}
-PostUp   = ip rule add priority 100 fwmark ${WG_MARK} lookup main
-PostUp   = ip rule add priority 200 lookup ${WG_TABLE}
-PostUp   = ip route flush cache
-
-# IPv6：仅当明确选择时才接管（NEW，且不影响 IPv4）
-PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 route add default dev ${WG_IF} table ${WG_TABLE} || true
-PostUp   = [ "${USE_V6_OUT}" = "yes" ] && ip -6 rule add priority 200 lookup ${WG_TABLE} || true
-
-PostDown = ip rule del priority 50 to ${server_ip} lookup main
-PostDown = ip rule del priority 100 fwmark ${WG_MARK} lookup main
-PostDown = ip rule del priority 200 lookup ${WG_TABLE}
-PostDown = ip route flush table ${WG_TABLE}
-PostDown = ip -6 route flush table ${WG_TABLE}
-PostDown = iptables -t mangle -D PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
-PostDown = iptables -t mangle -D OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
-
-[Peer]
-PublicKey = ${server_pub}
-Endpoint = ${server_ip}:${server_port}
-AllowedIPs = ${allowed_ips}
-PersistentKeepalive = 25
-EOF
+  iptables -t mangle -D OUTPUT -m connmark --mark ${OVPN_MARK} -j MARK --set-mark ${OVPN_MARK} 2>/dev/null || true
 }
 
 # ================== 启动 ==================
-start_wg() {
-  log "启动 WG（保持原始顺序）"
-  systemctl enable --now wg-quick@${WG_IF}
+start_openvpn() {
+  log "启动 OpenVPN Client（使用 /root/client.ovpn）"
+  openvpn --config "${OVPN_CONF}" --daemon
+  sleep 3
 }
 
-pause_for_peer() {
-  echo
-  echo "================ 等待出口机对接 ================="
-  echo "请在【出口机】执行："
-  echo "  wg set wg0 peer $(cat ${WG_PUB}) allowed-ips 10.66.66.2/32,fd10::2/128"
-  echo "  wg-quick save wg0"
-  echo
-  read -r -p "出口机完成后，回到这里按 Enter 继续..." _
+# ================== policy routing ==================
+setup_policy() {
+  log "设置 policy routing（等价 WG 版）"
+
+  ip route add default dev ${OVPN_IF} table ${OVPN_TABLE}
+  ip rule add fwmark ${OVPN_MARK} lookup ${OVPN_TABLE}
+  ip rule add priority 32766 lookup main
+
+  iptables -t mangle -A OUTPUT -m connmark --mark ${OVPN_MARK} -j MARK --set-mark ${OVPN_MARK}
 }
 
-# ================== 最终验证（NEW） ==================
+# ================== 验证 ==================
 verify() {
   log "最终出口验证"
-
-  echo "IPv4 出口（curl ipinfo.io）："
+  echo "IPv4 出口："
   curl --max-time 10 ipinfo.io || true
-  echo
-
-  echo "IPv6 出口（curl -6 ip.sb）："
-  curl -6 --max-time 10 ip.sb || true
 }
 
 # ================== 主流程 ==================
 need_root
-select_ipv6_mode
+
+[[ -f "${OVPN_CONF}" ]] || {
+  echo "❌ 未找到 ${OVPN_CONF}，请先在出口机执行 out-openvpn.sh"
+  exit 1
+}
+
 apt_fix_and_install
 
 main_info="$(detect_main)"
-MAIN_GW="${main_info%%|*}"
 MAIN_IF="${main_info#*|}"
-
-log "入口机原始出口：${MAIN_IF} via ${MAIN_GW}"
-
-read -r -p "出口机公网 IP： " SERVER_IP
-read -r -p "WireGuard 端口（默认 51820）： " SERVER_PORT
-SERVER_PORT="${SERVER_PORT:-51820}"
-read -r -p "出口机 Server 公钥： " SERVER_PUB
+log "入口机原始出口接口：${MAIN_IF}"
 
 clean_old
-gen_keys
-write_conf "${SERVER_IP}" "${SERVER_PORT}" "${SERVER_PUB}"
-start_wg
-
-echo
-echo "====== CLIENT 公钥（复制到出口机） ======"
-cat "${WG_PUB}"
-echo "=========================================="
-
-pause_for_peer
+start_openvpn
+setup_policy
 verify
 
 echo
-echo "✅ 完成（方案 A，IPv6 出口模式：${USE_V6_OUT}）"
-echo "紧急回滚：wg-quick down ${WG_IF}"
+echo "✅ 完成：OpenVPN TCP 出口已接管新流量"
+echo "紧急回滚："
+echo "  pkill openvpn"
+echo "  ip rule flush"
+echo "  ip route flush table ${OVPN_TABLE}"
