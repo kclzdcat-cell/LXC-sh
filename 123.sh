@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ================== 基本参数 ==================
+# ================== 参数 ==================
 WG_IF="wg0"
 WG_TABLE="51820"
 WG_MARK="0x1"
+WG_MTU="1280"
 
 WG_ADDR4="10.66.66.2/32"
 WG_ADDR6="fd10::2/128"
@@ -16,7 +17,7 @@ WG_PUB="${WG_DIR}/${WG_IF}.pub"
 
 log(){ echo -e "\n[IN] $*\n"; }
 
-# ================== 基础函数 ==================
+# ================== 基础 ==================
 need_root() {
   [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
 }
@@ -48,8 +49,9 @@ detect_main() {
   echo "${gw}|${ifc}"
 }
 
+# ================== 清理 ==================
 clean_old() {
-  log "清理旧 wg（不动默认路由）"
+  log "清理旧 WG（不动默认路由）"
   systemctl disable --now wg-quick@${WG_IF} 2>/dev/null || true
   wg-quick down ${WG_IF} 2>/dev/null || true
   ip link del ${WG_IF} 2>/dev/null || true
@@ -60,6 +62,7 @@ clean_old() {
   ip -6 route flush table ${WG_TABLE} 2>/dev/null || true
 }
 
+# ================== Key ==================
 gen_keys() {
   log "生成入口机密钥"
   umask 077
@@ -68,21 +71,31 @@ gen_keys() {
   chmod 600 "${WG_KEY}" "${WG_PUB}"
 }
 
+# ================== 配置 ==================
 write_conf() {
   local server_ip="$1"
   local server_port="$2"
   local server_pub="$3"
 
-  log "写入 wg0.conf"
+  log "写入 wg0.conf（MTU 在接管流量前生效）"
   cat >"${WG_CONF}" <<EOF
 [Interface]
 Address = ${WG_ADDR4}, ${WG_ADDR6}
 PrivateKey = $(cat "${WG_KEY}")
 Table = off
 
+# ★ 关键：MTU 必须在 WG 接管流量前生效 ★
+PostUp   = ip link set dev ${WG_IF} mtu ${WG_MTU}
+PostDown = ip link set dev ${WG_IF} mtu 1420 || true
+
+# 保护所有从原网卡进来的连接（SSH 永不掉）
 PostUp   = iptables -t mangle -A PREROUTING -i ${MAIN_IF} -j CONNMARK --set-mark ${WG_MARK}
 PostUp   = iptables -t mangle -A OUTPUT -m connmark --mark ${WG_MARK} -j MARK --set-mark ${WG_MARK}
+
+# 出口机 endpoint 永远走原网卡（避免路由套娃）
 PostUp   = ip rule add priority 50 to ${server_ip} lookup main
+
+# WG 专用路由表
 PostUp   = ip route add default dev ${WG_IF} table ${WG_TABLE}
 PostUp   = ip rule add priority 100 fwmark ${WG_MARK} lookup main
 PostUp   = ip rule add priority 200 lookup ${WG_TABLE}
@@ -103,14 +116,15 @@ PersistentKeepalive = 25
 EOF
 }
 
+# ================== 启动 ==================
 start_wg() {
-  log "启动 wg（此时还未完全生效）"
+  log "启动 WG（此时 MTU 已正确生效）"
   systemctl enable --now wg-quick@${WG_IF}
 }
 
 pause_for_peer() {
   echo
-  echo "================ 等待出口机操作 ================"
+  echo "================ 等待出口机对接 ================="
   echo "请在【出口机】执行："
   echo "  wg set wg0 peer $(cat ${WG_PUB}) allowed-ips 10.66.66.2/32,fd10::2/128"
   echo "  wg-quick save wg0"
@@ -118,18 +132,11 @@ pause_for_peer() {
   read -r -p "出口机完成后，回到这里按 Enter 继续..." _
 }
 
-final_tune() {
-  log "设置 MTU=1280（关键，保证下载速度）"
-  ip link set dev ${WG_IF} mtu 1280
-  ip route flush cache
-  ip -6 route flush cache 2>/dev/null || true
-}
-
 verify() {
   log "最终验证"
   wg show ${WG_IF}
   echo
-  echo "IPv4 出口（应为出口机）："
+  echo "IPv4 出口（必须是出口机 IP）："
   curl -4 --max-time 10 ip.sb || true
 }
 
@@ -144,7 +151,7 @@ MAIN_IF="${main_info#*|}"
 log "入口机原始出口：${MAIN_IF} via ${MAIN_GW}"
 
 read -r -p "出口机公网 IP： " SERVER_IP
-read -r -p "WireGuard 端口（默认51820）： " SERVER_PORT
+read -r -p "WireGuard 端口（默认 51820）： " SERVER_PORT
 SERVER_PORT="${SERVER_PORT:-51820}"
 read -r -p "出口机 Server 公钥： " SERVER_PUB
 
@@ -163,13 +170,12 @@ cat "${WG_PUB}"
 echo "=========================================="
 
 pause_for_peer
-final_tune
 verify
 
 echo
 echo "✅ 完成："
-echo "- 入站仍是原 IP（SSH 不断）"
-echo "- IPv4 出站走出口机（wg）"
-echo "- MTU 已优化，下载速度正常"
+echo "- IPv4 出口 = 出口机 IP"
+echo "- HTTPS / GitHub 下载正常"
+echo "- SSH / 入站永不掉"
 echo
 echo "紧急回滚：wg-quick down ${WG_IF}"
