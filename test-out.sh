@@ -1,48 +1,54 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== WireGuard 出口机（稳定服务端）==="
+WG_IF="wg0"
+WG_PORT=51820
+WG_NET4="10.66.66.0/24"
+WG_IP4="10.66.66.1/24"
 
-### 0. 基础修复
-rm -f /var/lib/dpkg/lock*
-rm -f /var/cache/apt/archives/lock
-dpkg --configure -a || true
+echo "== WireGuard 出口机部署 =="
 
-### 1. 安装依赖
-apt update
-apt install -y wireguard iproute2 iptables curl
+apt update -y
+apt install -y wireguard iptables iproute2 curl
 
-### 2. 开启转发
+# 开启转发
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv6.conf.all.forwarding=1
 
-### 3. 清理旧 WG
-ip link del wg0 2>/dev/null || true
+# 清理旧接口
+wg-quick down ${WG_IF} 2>/dev/null || true
+ip link del ${WG_IF} 2>/dev/null || true
 
-### 4. 生成密钥
+# 生成密钥
 SERVER_PRIV=$(wg genkey)
 SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
 
-### 5. 创建接口
-ip link add wg0 type wireguard
-ip addr add 10.0.0.1/24 dev wg0
-ip link set wg0 up
+CLIENT_PRIV=$(wg genkey)
+CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
 
-### 6. 配置 WireGuard（先不加 peer）
-wg set wg0 private-key <(echo "$SERVER_PRIV") listen-port 51820
+# 写配置
+cat > /etc/wireguard/${WG_IF}.conf <<EOF
+[Interface]
+Address = ${WG_IP4}
+ListenPort = ${WG_PORT}
+PrivateKey = ${SERVER_PRIV}
 
-### 7. NAT（IPv4）
-WAN_IF=$(ip route | awk '/default/ {print $5; exit}')
-iptables -t nat -A POSTROUTING -o "$WAN_IF" -j MASQUERADE
+PostUp = iptables -t nat -A POSTROUTING -o \$(ip route | awk '/default/ {print \$5}') -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o \$(ip route | awk '/default/ {print \$5}') -j MASQUERADE
 
-### 8. 显示给入口机的信息
+[Peer]
+PublicKey = ${CLIENT_PUB}
+AllowedIPs = 10.66.66.2/32
+EOF
+
+# 启动
+wg-quick up ${WG_IF}
+systemctl enable wg-quick@${WG_IF}
+
 echo
-echo "========== 给入口机填写的信息 =========="
-echo "出口机公网 IPv4 : $(curl -4 -s ip.sb)"
-echo "WireGuard 端口  : 51820"
-echo "Server 公钥     : $SERVER_PUB"
-echo "=========================================="
-echo
-
-### 9. 当前状态
-wg show
+echo "===== 入口机需要用的信息 ====="
+echo "出口机 IP      : $(curl -4 -s ip.sb)"
+echo "WireGuard 端口 : ${WG_PORT}"
+echo "Server 公钥    : ${SERVER_PUB}"
+echo "Client 私钥    : ${CLIENT_PRIV}"
+echo "================================"
