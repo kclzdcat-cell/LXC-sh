@@ -1,68 +1,53 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== WireGuard 入口机（出站全走 WG / SSH 永不掉）==="
+WG_IF="wg0"
+WG_MARK=51820
+WG_TABLE=51820
 
-### 0. 修复 dpkg
-rm -f /var/lib/dpkg/lock*
-rm -f /var/cache/apt/archives/lock
-dpkg --configure -a || true
+# ====== 你从出口机复制过来的信息 ======
+SERVER_IP="出口机公网IP"
+SERVER_PORT=51820
+SERVER_PUBKEY="出口机Server公钥"
+CLIENT_PRIVKEY="Client私钥"
+# ======================================
 
-### 1. 安装依赖
-apt update
-apt install -y wireguard iproute2 iptables curl
+apt update -y
+apt install -y wireguard iptables iproute2 curl
 
-### 2. 用户输入（手动，最稳）
-read -p "出口机公网 IP: " SERVER_IP
-read -p "WireGuard 端口 [51820]: " SERVER_PORT
-SERVER_PORT=${SERVER_PORT:-51820}
-read -p "出口机 Server 公钥: " SERVER_PUB
+# 清理旧环境
+wg-quick down ${WG_IF} 2>/dev/null || true
+ip link del ${WG_IF} 2>/dev/null || true
+iptables -t mangle -F
+ip rule del fwmark ${WG_MARK} table ${WG_TABLE} 2>/dev/null || true
+ip route flush table ${WG_TABLE}
 
-### 3. 清理旧配置（不影响 SSH）
-wg-quick down wg0 2>/dev/null || true
-ip link del wg0 2>/dev/null || true
-ip rule del fwmark 51820 table 51820 2>/dev/null || true
-ip route flush table 51820 2>/dev/null || true
-iptables -t mangle -F || true
+# 创建 WG 接口
+ip link add ${WG_IF} type wireguard
+wg set ${WG_IF} private-key <(echo "${CLIENT_PRIVKEY}") peer ${SERVER_PUBKEY} endpoint ${SERVER_IP}:${SERVER_PORT} allowed-ips 0.0.0.0/0 persistent-keepalive 25
 
-### 4. 生成客户端密钥
-CLIENT_PRIV=$(wg genkey)
-CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
+ip addr add 10.66.66.2/24 dev ${WG_IF}
+ip link set ${WG_IF} up
 
-### 5. 创建 WG 接口
-ip link add wg0 type wireguard
-ip addr add 10.0.0.2/24 dev wg0
+# ===== 核心：策略路由（不会断 SSH） =====
 
-wg set wg0 \
-  private-key <(echo "$CLIENT_PRIV") \
-  peer "$SERVER_PUB" \
-  endpoint "$SERVER_IP:$SERVER_PORT" \
-  allowed-ips 0.0.0.0/0 \
-  persistent-keepalive 25
+# 1. WG fwmark
+wg set ${WG_IF} fwmark ${WG_MARK}
 
-ip link set wg0 up
+# 2. WG 路由表
+ip route add default dev ${WG_IF} table ${WG_TABLE}
+ip rule add fwmark ${WG_MARK} table ${WG_TABLE}
 
-### 6. 策略路由（核心，不动默认路由）
-grep -q "^51820 wg$" /etc/iproute2/rt_tables || echo "51820 wg" >> /etc/iproute2/rt_tables
+# 3. mangle OUTPUT（顺序非常关键）
+iptables -t mangle -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+iptables -t mangle -A OUTPUT -p tcp --dport 22 -j RETURN
+iptables -t mangle -A OUTPUT -o lo -j RETURN
+iptables -t mangle -A OUTPUT -j MARK --set-mark ${WG_MARK}
 
-wg set wg0 fwmark 51820
-ip route add default dev wg0 table 51820
-ip rule add fwmark 51820 table 51820
+# 刷新缓存
+ip route flush cache
 
-### 7. 只标记“出站流量”
-iptables -t mangle -A OUTPUT -j MARK --set-mark 51820
-iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
-
-### 8. 输出信息
 echo
-echo "========== 需要添加到出口机的 Peer =========="
-echo "Client 公钥 : $CLIENT_PUB"
-echo "AllowedIPs  : 10.0.0.2/32"
-echo "=============================================="
-echo
-
-echo "=== WireGuard 状态 ==="
-wg show
-echo
-echo "=== 出口 IP 验证 ==="
+echo "=== WireGuard 已启用（SSH 不会断） ==="
+echo "当前出口 IP："
 curl -4 ip.sb || true
