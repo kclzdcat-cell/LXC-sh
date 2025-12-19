@@ -2,140 +2,130 @@
 set -e
 
 echo "==========================================="
-echo " OpenVPN 出口服务器自动部署脚本 V12.1（IPv4 + IPv6 双栈 + 指纹修复版）"
+echo " OpenVPN 出口服务器自动部署脚本（v3.3 修复版）"
+echo " ✔ 协议强制 IPv6 (udp6/tcp6)"
+echo " ✔ 修复 SSH 验证端口参数错误"
+echo " ✔ 包含 NAT 修复与自动上传验证"
 echo "==========================================="
 
-#----------- 检测出口 IPv4 / IPv6 -----------
-PUB_IP4=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
-PUB_IP6=$(curl -s ipv6.ip.sb || echo "")
+#======================================================
+#   1. 自动检测公网 IPv6
+#======================================================
+PUB_IP6=$(ip -6 addr show | grep global | grep -v temporary | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
 
-echo "出口 IPv4: $PUB_IP4"
-echo "出口 IPv6: ${PUB_IP6:-未检测到 IPv6}"
+if [[ -z "$PUB_IP6" ]]; then
+    echo "❌ 未检测到公网 IPv6，无法作为出口节点"
+    exit 1
+fi
 
-#----------- 检测网卡 -----------
-NIC=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
-echo "出口网卡: $NIC"
+echo "检测到出口公网 IPv6: $PUB_IP6"
+
+#======================================================
+#   2. 自动检测出口网卡
+#======================================================
+NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
+NIC=${NIC:-eth0}
+
+echo "检测到出口网卡: $NIC"
 
 apt update -y
-apt install -y openvpn easy-rsa sshpass iptables-persistent curl
+apt install -y openvpn easy-rsa sshpass iptables-persistent
 
-#----------- 重建 PKI -----------
+#======================================================
+#   3. 初始化 PKI (证书生成)
+#======================================================
 rm -rf /etc/openvpn/easy-rsa
 mkdir -p /etc/openvpn/easy-rsa
 cp -r /usr/share/easy-rsa/* /etc/openvpn/easy-rsa/
 cd /etc/openvpn/easy-rsa
 
 export EASYRSA_BATCH=1
-
-echo ">>> 初始化 PKI ..."
 ./easyrsa init-pki
-
-echo ">>> 生成 CA ..."
 ./easyrsa build-ca nopass
-
-echo ">>> 生成服务器证书 ..."
 ./easyrsa build-server-full server nopass
-
-echo ">>> 生成客户端证书 ..."
 ./easyrsa build-client-full client nopass
-
-echo ">>> 生成 DH 参数 ..."
 ./easyrsa gen-dh
+openvpn --genkey secret ta.key
 
-#----------- 拷贝证书 -----------
 cp pki/ca.crt /etc/openvpn/
 cp pki/dh.pem /etc/openvpn/
 cp pki/issued/server.crt /etc/openvpn/
 cp pki/private/server.key /etc/openvpn/
 cp pki/issued/client.crt /etc/openvpn/
 cp pki/private/client.key /etc/openvpn/
+cp ta.key /etc/openvpn/
 
-#----------- 查找空闲端口 -----------
-find_free_port() {
-  p=$1
-  while ss -tuln | grep -q ":$p "; do
-    p=$((p+1))
-  done
-  echo $p
-}
+#======================================================
+#   4. 端口配置
+#======================================================
+UDP_PORT=1196
+TCP_PORT=443
 
-UDP_PORT=$(find_free_port 1194)
-TCP_PORT=$(find_free_port 443)
+echo "使用 UDP 端口: $UDP_PORT"
+echo "使用 TCP 端口: $TCP_PORT"
 
-echo "UDP端口 = $UDP_PORT"
-echo "TCP端口 = $TCP_PORT"
-
-#----------- 启用 IPv4 / IPv6 转发 -----------
-
+#======================================================
+#   5. 修复 NAT 转发
+#======================================================
 echo 1 >/proc/sys/net/ipv4/ip_forward
-sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+echo 1 >/proc/sys/net/ipv6/conf/all/forwarding
 
-echo 1 >/proc/sys/net/ipv6/conf/all/forwarding || true
-sed -i 's/^#*net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf || true
+# UDP 网段 10.8.0.0/24 -> 出口网卡
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $NIC -j MASQUERADE
 
-#----------- 配置 NAT (IPv4) -----------
-iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o $NIC -j MASQUERADE
+# TCP 网段 10.9.0.0/24 -> 出口网卡
+iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o $NIC -j MASQUERADE
 
-#----------- 配置 NAT (IPv6) 可用才启用 -----------
-HAS_IPV6=0
-if [[ -n "$PUB_IP6" ]]; then
-    if command -v ip6tables >/dev/null; then
-        HAS_IPV6=1
-        echo "检测到 IPv6，启用 IPv6 NAT..."
-        ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE || true
-    fi
-fi
+# IPv6 NAT
+ip6tables -t nat -A POSTROUTING -s fd00:1234::/64 -o $NIC -j MASQUERADE
 
 iptables-save >/etc/iptables/rules.v4
-ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+ip6tables-save >/etc/iptables/rules.v6
 
-#----------- server.conf（UDP）-----------
+#======================================================
+#   6. 生成服务端配置 server.conf (强制 udp6)
+#======================================================
 cat >/etc/openvpn/server.conf <<EOF
 port $UDP_PORT
-proto udp
+proto udp6
 dev tun
+topology subnet
 ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
-
+tls-crypt ta.key
 server 10.8.0.0 255.255.255.0
 server-ipv6 fd00:1234::/64
-
 push "redirect-gateway def1 ipv6 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
 push "dhcp-option DNS 1.1.1.1"
-push "dhcp-option DNS6 2620:119:35::35"
 push "dhcp-option DNS6 2606:4700:4700::1111"
-
-keepalive 10 120
 cipher AES-256-GCM
 auth SHA256
 persist-key
 persist-tun
+explicit-exit-notify 1
 verb 3
 EOF
 
-#----------- server-tcp.conf（TCP）-----------
+#======================================================
+#   7. 生成服务端配置 server-tcp.conf (强制 tcp6)
+#======================================================
 cat >/etc/openvpn/server-tcp.conf <<EOF
 port $TCP_PORT
-proto tcp
+proto tcp6
 dev tun
+topology subnet
 ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
-
+tls-crypt ta.key
 server 10.9.0.0 255.255.255.0
 server-ipv6 fd00:1234::/64
-
 push "redirect-gateway def1 ipv6 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
 push "dhcp-option DNS 1.1.1.1"
-push "dhcp-option DNS6 2620:119:35::35"
 push "dhcp-option DNS6 2606:4700:4700::1111"
-
-keepalive 10 120
 cipher AES-256-GCM
 auth SHA256
 persist-key
@@ -143,14 +133,17 @@ persist-tun
 verb 3
 EOF
 
-#----------- 启动服务 -----------
+# 重启服务
 systemctl enable openvpn@server
 systemctl restart openvpn@server
 systemctl enable openvpn@server-tcp
 systemctl restart openvpn@server-tcp
 
-#----------- 生成 client.ovpn -----------
+#======================================================
+#   8. 生成客户端配置 client.ovpn (强制 IPv6)
+#======================================================
 CLIENT=/root/client.ovpn
+
 cat >$CLIENT <<EOF
 client
 dev tun
@@ -163,19 +156,8 @@ auth SHA256
 auth-nocache
 resolv-retry infinite
 
-remote $PUB_IP4 $UDP_PORT udp
-remote $PUB_IP4 $TCP_PORT tcp
-EOF
-
-# 自动加入 IPv6 远程
-if [[ $HAS_IPV6 -eq 1 ]]; then
-cat >>$CLIENT <<EOF
-remote $PUB_IP6 $UDP_PORT udp
-remote $PUB_IP6 $TCP_PORT tcp
-EOF
-fi
-
-cat >>$CLIENT <<EOF
+remote $PUB_IP6 $UDP_PORT udp6
+remote $PUB_IP6 $TCP_PORT tcp6
 
 <ca>
 $(cat /etc/openvpn/ca.crt)
@@ -188,30 +170,85 @@ $(cat /etc/openvpn/client.crt)
 <key>
 $(cat /etc/openvpn/client.key)
 </key>
+
+<tls-crypt>
+$(cat /etc/openvpn/ta.key)
+</tls-crypt>
 EOF
 
 echo "client.ovpn 已生成：/root/client.ovpn"
 
-#----------- 上传到入口服务器 -----------
-echo "请输入入口服务器 SSH 信息："
-read -p "入口 IP：" IN_IP
-read -p "入口端口(默认22)：" IN_PORT
+#======================================================
+#   9. 自动上传与验证 (最终修复逻辑)
+#======================================================
+echo "=============== 上传 client.ovpn 到入口服务器 ==============="
+
+read -p "入口服务器 IP（IPv6/IPv4，无需加[]）： " IN_IP
+read -p "入口 SSH 端口（默认22）： " IN_PORT
 IN_PORT=${IN_PORT:-22}
-read -p "入口 SSH 用户(默认root)：" IN_USER
+read -p "SSH 用户（默认 root）： " IN_USER
 IN_USER=${IN_USER:-root}
-read -p "入口 SSH 密码：" IN_PASS
+read -p "SSH 密码： " IN_PASS
 
-echo ">>> 正在清理旧的主机指纹..."
-mkdir -p /root/.ssh
-touch /root/.ssh/known_hosts
-# 尝试删除纯 IP 记录
-ssh-keygen -f /root/.ssh/known_hosts -R "$IN_IP" >/dev/null 2>&1 || true
-# 尝试删除 [IP]:Port 格式的记录 (非标准端口常见)
-ssh-keygen -f /root/.ssh/known_hosts -R "[$IN_IP]:$IN_PORT" >/dev/null 2>&1 || true
+# 清理可能存在的方括号，只保留纯 IP
+CLEAN_IP=$(echo "$IN_IP" | tr -d '[]')
+# 清理旧主机的 Key 防止指纹报错
+ssh-keygen -R "$CLEAN_IP" >/dev/null 2>&1 || true
 
-echo ">>> 开始传输文件..."
-# 添加了 -o UserKnownHostsFile=/dev/null 作为双重保险，强制忽略指纹差异
-sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $CLIENT $IN_USER@$IN_IP:/root/
+# --- 核心修复：分离 SCP 和 SSH 的地址格式 ---
+upload_and_verify() {
+    local RAW_IP=$1      # 纯净 IP (给 ssh 用)
+    local SCP_HOST=""    # 格式化 IP (给 scp 用)
+    
+    # 判断是否为 IPv6 (包含冒号)
+    if [[ "$RAW_IP" == *":"* ]]; then
+        SCP_HOST="[${RAW_IP}]"  # IPv6: scp 需要 [IP]
+    else
+        SCP_HOST="${RAW_IP}"    # IPv4: scp 直接用 IP
+    fi
 
-echo "上传成功！出口服务器部署完成！"
-echo "==========================================="
+    local TARGET_FILE="/root/client.ovpn"
+    
+    echo "------------------------------------------------"
+    echo ">>> 正在尝试传输..."
+    echo "    SSH 目标 (验证用): ${RAW_IP}"
+    echo "    SCP 目标 (传输用): ${SCP_HOST}"
+    
+    # 1. SCP 上传 (注意: -P 大写)
+    sshpass -p "$IN_PASS" scp -P $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        "$CLIENT" "${IN_USER}@${SCP_HOST}:${TARGET_FILE}"
+        
+    if [ $? -eq 0 ]; then
+        echo ">>> SCP 上传看似成功，正在进行最终验证..."
+        
+        # 2. SSH 远程验证 (注意: -p 小写，且使用 RAW_IP 不带括号)
+        sshpass -p "$IN_PASS" ssh -p $IN_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "${IN_USER}@${RAW_IP}" "ls -lh $TARGET_FILE"
+            
+        if [ $? -eq 0 ]; then
+            echo "✅ 验证成功！文件确认存在于入口服务器。"
+            return 0
+        else
+            echo "❌ 验证失败：虽然 SCP 没报错，但远程找不到文件 (可能是权限或路径问题)。"
+            return 1
+        fi
+    else
+        echo "❌ SCP 上传失败 (返回码 $?)。"
+        return 1
+    fi
+}
+
+# --- 执行 ---
+# 直接传入清理后的 IP，由函数内部自动判断格式
+if upload_and_verify "$CLEAN_IP"; then
+    echo "======================================================="
+    echo "🚀 OpenVPN 出口节点部署完成！"
+    echo "✅ client.ovpn 已成功传输并验证。"
+    echo "👉 下一步：请登录入口服务器，运行 warp-in.sh"
+    echo "======================================================="
+else
+    echo "======================================================="
+    echo "❌ 自动上传最终失败。"
+    echo "   请手动下载 /root/client.ovpn 并上传到入口服务器的 /root/ 目录"
+    echo "======================================================="
+fi
