@@ -1,52 +1,48 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== WireGuard 出口机（最终稳定版）==="
+echo "=== WireGuard 出口机（稳定服务端）==="
 
-# 必须 root
-[ "$(id -u)" != "0" ] && echo "请使用 root 执行" && exit 1
+### 0. 基础修复
+rm -f /var/lib/dpkg/lock*
+rm -f /var/cache/apt/archives/lock
+dpkg --configure -a || true
 
-# 基础依赖
+### 1. 安装依赖
 apt update
-apt install -y wireguard iptables iproute2 curl
+apt install -y wireguard iproute2 iptables curl
 
-# 清理旧接口
-wg-quick down wg0 2>/dev/null || true
-ip link del wg0 2>/dev/null || true
-
-# 开启转发
+### 2. 开启转发
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv6.conf.all.forwarding=1
 
-# 生成密钥
-WG_PRIV=$(wg genkey)
-WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
+### 3. 清理旧 WG
+ip link del wg0 2>/dev/null || true
 
-# 写 wg0.conf
-cat > /etc/wireguard/wg0.conf <<EOF
-[Interface]
-Address = 10.0.0.1/24, fd10::1/64
-ListenPort = 51820
-PrivateKey = $WG_PRIV
+### 4. 生成密钥
+SERVER_PRIV=$(wg genkey)
+SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
 
-PostUp = iptables -t nat -A POSTROUTING -o \$(ip route | awk '/default/ {print \$5; exit}') -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -o \$(ip route | awk '/default/ {print \$5; exit}') -j MASQUERADE
-EOF
+### 5. 创建接口
+ip link add wg0 type wireguard
+ip addr add 10.0.0.1/24 dev wg0
+ip link set wg0 up
 
-chmod 600 /etc/wireguard/wg0.conf
+### 6. 配置 WireGuard（先不加 peer）
+wg set wg0 private-key <(echo "$SERVER_PRIV") listen-port 51820
 
-# 启动
-systemctl enable wg-quick@wg0
-systemctl restart wg-quick@wg0
+### 7. NAT（IPv4）
+WAN_IF=$(ip route | awk '/default/ {print $5; exit}')
+iptables -t nat -A POSTROUTING -o "$WAN_IF" -j MASQUERADE
 
-# 输出给入口机用的信息
-PUB_IP=$(curl -4 -s ip.sb || echo "获取失败")
-
+### 8. 显示给入口机的信息
 echo
-echo "========== 给入口机填写 =========="
-echo "出口机公网 IP : $PUB_IP"
-echo "WireGuard 端口 : 51820"
-echo "Server 公钥   : $WG_PUB"
-echo "=================================="
+echo "========== 给入口机填写的信息 =========="
+echo "出口机公网 IPv4 : $(curl -4 -s ip.sb)"
+echo "WireGuard 端口  : 51820"
+echo "Server 公钥     : $SERVER_PUB"
+echo "=========================================="
 echo
-echo "出口机部署完成"
+
+### 9. 当前状态
+wg show
