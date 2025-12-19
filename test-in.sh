@@ -1,101 +1,112 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "==========================================="
-echo " OpenVPN 入口部署（IPv4 策略路由版）"
-echo " 功能：IPv4 入站不动，IPv4 出站走 OpenVPN"
-echo " IPv6：完全不接管（SSH 永久安全）"
-echo "==========================================="
+# =========================================================
+# OpenVPN Ingress Script
+# Mode   : IPv4 出站接管 + SSH 永不掉（策略路由）
+# Version: 2.0 (SSH SAFE FIX)
+# =========================================================
 
-# 0. 权限检查
-[[ $EUID -ne 0 ]] && { echo "请使用 root 运行"; exit 1; }
+SCRIPT_VERSION="2.0"
 
-# 1. 安装依赖
-echo ">>> 安装依赖..."
-apt update -y
-apt install -y openvpn iptables iptables-persistent curl iproute2
+echo "=================================================="
+echo " OpenVPN 入口部署 v${SCRIPT_VERSION}"
+echo " IPv4 出站接管 | SSH 永不断 | 不改默认路由"
+echo "=================================================="
+echo
 
-# 2. 检查 client.ovpn
-if [[ ! -f /root/client.ovpn ]]; then
-  echo "❌ 未找到 /root/client.ovpn"
-  exit 1
+# ---------- 基础检查 ----------
+if [[ $EUID -ne 0 ]]; then
+  echo "请用 root 运行"; exit 1
 fi
 
-# 3. 部署 OpenVPN 配置
-echo ">>> 部署 OpenVPN 配置..."
+# ---------- 变量 ----------
+OVPN_IF="tun0"
+OVPN_TABLE="100"
+OVPN_MARK="0x66"
+
+MAIN_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
+MAIN_GW=$(ip route get 1.1.1.1 | awk '{print $3; exit}')
+
+log(){ echo -e "\n[IN] $*\n"; }
+
+log "检测到主网卡：${MAIN_IF} via ${MAIN_GW}"
+
+# ---------- 安装依赖 ----------
+log "安装依赖"
+apt update -y
+apt install -y openvpn iproute2 iptables iptables-persistent curl
+
+# ---------- 检查 client.ovpn ----------
+if [[ ! -f /root/client.ovpn ]]; then
+  echo "❌ 未找到 /root/client.ovpn"; exit 1
+fi
+
+# ---------- 部署 OpenVPN ----------
+log "部署 OpenVPN Client"
 mkdir -p /etc/openvpn/client
 cp /root/client.ovpn /etc/openvpn/client/client.conf
 
-# 4. 修改 client.conf（关键）
-echo ">>> 修改 OpenVPN 客户端配置（策略路由模式）..."
+# ---------- 清理旧规则 ----------
+log "清理旧策略路由"
+ip rule del fwmark ${OVPN_MARK} table ${OVPN_TABLE} 2>/dev/null || true
+ip route flush table ${OVPN_TABLE} 2>/dev/null || true
+iptables -t mangle -F OUTPUT || true
 
-sed -i '/redirect-gateway/d' /etc/openvpn/client/client.conf
-sed -i '/route-nopull/d' /etc/openvpn/client/client.conf
+# ---------- 启动 OpenVPN ----------
+log "启动 OpenVPN"
+systemctl daemon-reload
+systemctl enable --now openvpn-client@client
 
-cat >> /etc/openvpn/client/client.conf <<'EOF'
-
-# ====== 策略路由核心 ======
-route-nopull
-
-# 禁止 IPv6（SSH 生命线）
-pull-filter ignore "route-ipv6"
-pull-filter ignore "ifconfig-ipv6"
-pull-filter ignore "redirect-gateway-ipv6"
-
-# DNS
-dhcp-option DNS 8.8.8.8
-dhcp-option DNS 1.1.1.1
-EOF
-
-# 5. 启用 IPv4 转发
-echo ">>> 启用 IPv4 转发..."
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-# 6. 策略路由配置
-echo ">>> 配置策略路由..."
-
-# 路由表
-grep -q '^100 ovpn' /etc/iproute2/rt_tables || echo "100 ovpn" >> /etc/iproute2/rt_tables
-
-# 清理旧规则
-ip rule del fwmark 0x66 table ovpn 2>/dev/null || true
-ip route flush table ovpn 2>/dev/null || true
-iptables -t mangle -D OUTPUT -m mark --mark 0x66 -j ACCEPT 2>/dev/null || true
-iptables -t mangle -D OUTPUT -j MARK --set-mark 0x66 2>/dev/null || true
-
-# tun0 默认路由
-ip route add default dev tun0 table ovpn
-
-# 只标记本机新建连接（不影响入站）
-iptables -t mangle -A OUTPUT -m conntrack --ctstate NEW -j MARK --set-mark 0x66
-iptables -t mangle -A OUTPUT -m mark --mark 0x66 -j ACCEPT
-
-# 策略路由规则
-ip rule add fwmark 0x66 table ovpn priority 100
-
-iptables-save >/etc/iptables/rules.v4
-
-# 7. 启动 OpenVPN
-echo ">>> 启动 OpenVPN Client..."
-systemctl daemon-reexec
-systemctl restart openvpn-client@client
-
+log "等待 OpenVPN 建立隧道..."
 sleep 5
 
-# 8. 验证
-echo "==========================================="
-echo "验证状态："
-systemctl is-active --quiet openvpn-client@client \
-  && echo "✔ OpenVPN 客户端运行中" \
-  || journalctl -u openvpn-client@client -n 10 --no-pager
+# ---------- 校验 tun0 ----------
+if ! ip link show ${OVPN_IF} >/dev/null 2>&1; then
+  echo "❌ tun0 未出现，OpenVPN 可能启动失败"
+  systemctl status openvpn-client@client --no-pager
+  exit 1
+fi
+
+# ---------- 关键修复点：SSH 永久放行 ----------
+log "配置 SSH 永不接管规则（关键）"
+
+# 1️⃣ SSH 端口直接 RETURN（回包不会被打 mark）
+iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
+
+# 2️⃣ 所有已建立连接 RETURN（防止现有会话被切）
+iptables -t mangle -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+# 3️⃣ 只有 NEW 连接才打 mark
+iptables -t mangle -A OUTPUT -m conntrack --ctstate NEW -j MARK --set-mark ${OVPN_MARK}
+
+# ---------- 策略路由 ----------
+log "配置策略路由（仅 IPv4 出站）"
+
+ip route add default dev ${OVPN_IF} table ${OVPN_TABLE}
+ip rule add fwmark ${OVPN_MARK} table ${OVPN_TABLE}
+
+ip route flush cache
+
+# ---------- 验证 ----------
+log "验证出口"
+
+echo "IPv4 出口："
+curl -4 --max-time 10 ip.sb || true
+echo
+
+echo "IPv6（应为本机，不受影响）："
+curl -6 --max-time 10 ip.sb || true
 
 echo
-echo "IPv4 出口（应为出口机）："
-curl -4 ip.sb || true
-
+echo "=================================================="
+echo "✅ 完成："
+echo "- SSH / 入站流量：原网卡 (${MAIN_IF})"
+echo "- IPv4 出站：OpenVPN (${OVPN_IF})"
+echo "- 默认路由：未修改"
 echo
-echo "IPv6（应为入口机原生）："
-curl -6 ip.sb || true
-
-echo "==========================================="
-echo "完成：IPv4 出站已走 OpenVPN，入站完全不受影响"
+echo "🆘 紧急回滚："
+echo "   systemctl stop openvpn-client@client"
+echo "   ip rule flush"
+echo "   iptables -t mangle -F OUTPUT"
+echo "=================================================="
