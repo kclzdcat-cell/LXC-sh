@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== WireGuard 入口机（SSH 永不掉线 · 最终修正版）==="
+echo "=== WireGuard 入口机（SSH 永不掉线 · 最终修正版）1.0==="
 
 CONF="/root/wg_client.conf"
 
